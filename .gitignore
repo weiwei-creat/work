@@ -1,4 +1,15 @@
 .DS_Store
+.env
+env.md
 server/.env
 client/.env
 **/.venv/**
+objathor/*
+logs/
+client/logs/
+client/room_descs/
+models/
+tmp/
+results
+**/__pycache__/
+*.pyc

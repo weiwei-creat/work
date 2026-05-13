@@ -20,25 +20,91 @@ import tempfile
 import os
 import time
 import hashlib
+from pathlib import Path
 
-with open("key.json", "r") as f:
-    key_dict = json.load(f)
+SERVER_DIR = Path(__file__).resolve().parent
+SAGE_ROOT = SERVER_DIR.parent
 
-ANTHROPIC_API_KEY = key_dict["ANTHROPIC_API_KEY"]
 
-API_TOKEN = key_dict["API_TOKEN"]
-API_URL_QWEN = key_dict["API_URL_QWEN"]
-API_URL_OPENAI = key_dict["API_URL_OPENAI"]
+def _clean_env_value(value: str) -> str:
+    value = value.strip().strip('"').strip("'")
+    value = value.replace("[1m", "").rstrip("]")
+    return value
+
+
+def _load_dotenv(path: Path) -> dict:
+    values = {}
+    if not path.exists():
+        return values
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = _clean_env_value(value)
+        values[key] = value
+        os.environ.setdefault(key, value)
+    return values
+
+
+def _load_key_json(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+env_dict = _load_dotenv(SAGE_ROOT / ".env")
+key_dict = _load_key_json(SERVER_DIR / "key.json")
+
+
+def _get_config(name: str, default: str = "") -> str:
+    return os.getenv(name) or env_dict.get(name) or key_dict.get(name, default)
+
+
+def _get_model_dict() -> dict:
+    configured = key_dict.get("MODEL_DICT") or {}
+    deepseek_model = _get_config("ANTHROPIC_MODEL", configured.get("claude") or configured.get("llm") or "deepseek-chat")
+    qwen_model = _get_config("QWEN_MODEL", configured.get("qwen") or configured.get("vlm") or "qwen-vl-max-latest")
+    model_dict = {
+        "claude": deepseek_model,
+        "llm": deepseek_model,
+        "qwen": qwen_model,
+        "vlm": qwen_model,
+        "openai": _get_config("OPENAI_MODEL", configured.get("openai") or qwen_model),
+        "glmv": _get_config("GLMV_MODEL", configured.get("glmv", qwen_model)),
+    }
+    model_dict.update({k: v for k, v in configured.items() if v})
+    if _get_config("ANTHROPIC_MODEL"):
+        model_dict["claude"] = _get_config("ANTHROPIC_MODEL")
+        model_dict["llm"] = _get_config("ANTHROPIC_MODEL")
+    if _get_config("QWEN_MODEL"):
+        model_dict["qwen"] = _get_config("QWEN_MODEL")
+        model_dict["vlm"] = _get_config("QWEN_MODEL")
+    return model_dict
+
+ANTHROPIC_API_KEY = _get_config("ANTHROPIC_API_KEY") or _get_config("ANTHROPIC_AUTH_TOKEN") or _get_config("DEEPSEEK_API_KEY")
+ANTHROPIC_BASE_URL = _get_config("ANTHROPIC_BASE_URL") or _get_config("DEEPSEEK_ANTHROPIC_BASE_URL")
+if ANTHROPIC_API_KEY:
+    os.environ.setdefault("ANTHROPIC_API_KEY", ANTHROPIC_API_KEY)
+if ANTHROPIC_BASE_URL:
+    os.environ.setdefault("ANTHROPIC_BASE_URL", ANTHROPIC_BASE_URL)
+
+API_TOKEN = _get_config("API_TOKEN") or _get_config("QWEN_API_KEY") or _get_config("DASHSCOPE_API_KEY")
+API_URL_QWEN = _get_config("API_URL_QWEN") or _get_config("QWEN_BASE_URL")
+API_URL_OPENAI = _get_config("API_URL_OPENAI") or API_URL_QWEN
 
 API_URL_DICT = {
     "qwen": API_URL_QWEN,
     "openai": API_URL_OPENAI,
+    "glmv": API_URL_QWEN,
 }
 
-MODEL_DICT = key_dict["MODEL_DICT"]
+MODEL_DICT = _get_model_dict()
 
-SERVER_URL = key_dict["TRELLIS_SERVER_URL"]
-FLUX_SERVER_URL = key_dict["FLUX_SERVER_URL"]
+SERVER_URL = _get_config("TRELLIS_SERVER_URL", "http://localhost:8080")
+FLUX_SERVER_URL = _get_config("FLUX_SERVER_URL")
 
 print("TRELLIS SERVER_URL: ", SERVER_URL, file=sys.stderr)
 
@@ -109,10 +175,12 @@ def get_client_api_key(api_service: str) -> str:
     which must be retrieved from LastPass and set as as environment variables
     """
 
-    client_id = os.getenv("API_CLIENT_ID", key_dict["API_CLIENT_ID"])
-    client_secret = os.getenv("API_CLIENT_SECRET", key_dict["API_CLIENT_SECRET"])
+    client_id = os.getenv("API_CLIENT_ID", key_dict.get("API_CLIENT_ID", ""))
+    client_secret = os.getenv("API_CLIENT_SECRET", key_dict.get("API_CLIENT_SECRET", ""))
 
-    url = key_dict["API_URL"]
+    url = key_dict.get("API_URL", "")
+    if not client_id or not client_secret or not url:
+        raise RuntimeError("Corporate API client credentials are not configured")
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
     scope_map = {"oai": "azureopenai-readwrite", "anthropic": "awsanthropic-readwrite"}
     data = {"grant_type": "client_credentials", "scope": scope_map[api_service]}

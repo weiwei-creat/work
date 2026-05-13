@@ -1,4 +1,5 @@
 from functools import partial
+from pathlib import Path
 
 import kornia
 import numpy as np
@@ -235,6 +236,14 @@ class FrozenCLIPSentenceEmbedder(AbstractEncoder):
         max_length=77,
     ):  # clip-vit-base-patch32
         super().__init__()
+        local_version = (
+            Path(__file__).resolve().parents[5]
+            / "models"
+            / "sentence-transformers"
+            / "clip-ViT-B-16"
+        )
+        if version == "sentence-transformers/clip-ViT-B-16" and local_version.exists():
+            version = str(local_version)
         self.transformer = SentenceTransformer(version)
         self.device = device
         self.max_length = max_length  # TODO: typical value?

@@ -26,8 +26,64 @@ import torch
 from pytorch3d.io import save_obj
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+import math
 
-def process_single_object(object_name: str, object_info: dict, room: Room, object_save_dir: str, selection_source = "generation"):
+
+def _env_bool(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name, default=0):
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name, default=1.0):
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def trellis_generation_enabled():
+    if "SAGE_ENABLE_TRELLIS_GENERATION" in os.environ:
+        return _env_bool("SAGE_ENABLE_TRELLIS_GENERATION")
+    if "SAGE_DISABLE_TRELLIS" in os.environ:
+        return not _env_bool("SAGE_DISABLE_TRELLIS")
+    return False
+
+
+def configured_selection_source(default_source: str) -> str:
+    configured_source = os.environ.get("SAGE_OBJECT_SOURCE")
+    if configured_source:
+        return configured_source
+    if trellis_generation_enabled():
+        return "generation"
+    return default_source
+
+
+def configured_object_quantity(quantity: int, remaining_room_budget=None) -> int:
+    quantity = max(1, int(quantity))
+
+    quantity_scale = max(0.0, _env_float("SAGE_OBJECT_QUANTITY_SCALE", 1.0))
+    if quantity_scale != 1.0:
+        quantity = max(1, int(math.ceil(quantity * quantity_scale)))
+
+    max_per_type = _env_int("SAGE_MAX_OBJECTS_PER_TYPE", 0)
+    if max_per_type > 0:
+        quantity = min(quantity, max_per_type)
+
+    if remaining_room_budget is not None:
+        quantity = min(quantity, max(0, remaining_room_budget))
+
+    return quantity
+
+def process_single_object(object_name: str, object_info: dict, room: Room, object_save_dir: str, selection_source = "objaverse"):
     """
     Process a single object type and return selected objects and updated recommendations.
     
@@ -47,11 +103,15 @@ def process_single_object(object_name: str, object_info: dict, room: Room, objec
     object_description = object_info["description"]
     object_location = object_info["location"]
     object_size = object_info["size"]
-    object_quantity = object_info["quantity"]
+    object_quantity = max(1, int(object_info["quantity"]))
     object_variance_type = object_info["variance_type"]
     object_place_guidance = object_info.get("place_guidance", f"Standard placement for {object_name}")
 
     
+
+    selection_source = configured_selection_source(selection_source)
+    if selection_source == "generation" and not trellis_generation_enabled():
+        selection_source = "objaverse"
 
     candidates = get_object_candidates(object_info, selection_source)
 
@@ -67,7 +127,7 @@ def process_single_object(object_name: str, object_info: dict, room: Room, objec
     # Filter candidates by room dimensions
     room_dims = room.dimensions
 
-    if selection_source == "objaverse":
+    if selection_source in {"objaverse", "objathor"}:
         filtered_candidates = []
         
         for candidate in candidates:
@@ -193,7 +253,7 @@ def process_single_object(object_name: str, object_info: dict, room: Room, objec
     
     return selected_objects, updated_recommendations
 
-def select_objects(object_info_dict: dict, room: Room, existing_objects: List[Object], current_layout: FloorPlan, selection_source = "generation"):
+def select_objects(object_info_dict: dict, room: Room, existing_objects: List[Object], current_layout: FloorPlan, selection_source = "objaverse"):
 
     object_save_dir = f"{RESULTS_DIR}/{current_layout.id}"
     os.makedirs(object_save_dir, exist_ok=True)
@@ -201,14 +261,42 @@ def select_objects(object_info_dict: dict, room: Room, existing_objects: List[Ob
     selected_objects = []
     updated_recommendations = []
     
-    # Use ThreadPoolExecutor with maximum 5 threads
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    max_workers = int(os.environ.get("SAGE_OBJECT_WORKERS", "1"))
+    max_workers = max(1, max_workers)
+    print(f"Object selection workers: {max_workers}", file=sys.stderr)
+    max_new_objects_per_room = _env_int("SAGE_MAX_NEW_OBJECTS_PER_ROOM", 0)
+    room_budget_remaining = max_new_objects_per_room if max_new_objects_per_room > 0 else None
+    configured_object_info_dict = {}
+    for object_name, object_info in object_info_dict.items():
+        adjusted_object_info = object_info.copy()
+        adjusted_quantity = configured_object_quantity(
+            adjusted_object_info.get("quantity", 1),
+            room_budget_remaining,
+        )
+        if adjusted_quantity < 1:
+            continue
+        adjusted_object_info["quantity"] = adjusted_quantity
+        configured_object_info_dict[object_name] = adjusted_object_info
+        if room_budget_remaining is not None:
+            room_budget_remaining -= adjusted_quantity
+            if room_budget_remaining <= 0:
+                break
+
+    print(
+        "Object quantity config: "
+        f"scale={_env_float('SAGE_OBJECT_QUANTITY_SCALE', 1.0)}, "
+        f"max_per_type={_env_int('SAGE_MAX_OBJECTS_PER_TYPE', 0) or 'unlimited'}, "
+        f"max_new_per_room={max_new_objects_per_room or 'unlimited'}",
+        file=sys.stderr,
+    )
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all tasks and store futures with their corresponding object names to maintain order
         future_to_object_name = {}
-        object_names_order = list(object_info_dict.keys())
+        object_names_order = list(configured_object_info_dict.keys())
         
         for object_name in object_names_order:
-            object_info = object_info_dict[object_name]
+            object_info = configured_object_info_dict[object_name]
             future = executor.submit(process_single_object, object_name, object_info, room, object_save_dir, selection_source)
             future_to_object_name[future] = object_name
         
@@ -232,6 +320,3 @@ def select_objects(object_info_dict: dict, room: Room, existing_objects: List[Ob
                 updated_recommendations.extend(recommendations)
 
     return selected_objects, updated_recommendations
-        
-
-        

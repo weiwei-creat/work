@@ -1,0 +1,1 @@
+"""Minimal VQ-VAE package."""

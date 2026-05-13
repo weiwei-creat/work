@@ -1,0 +1,1 @@
+"""Minimal taming modules package."""

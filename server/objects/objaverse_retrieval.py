@@ -25,9 +25,6 @@ import pickle
 import trimesh
 from scipy.spatial.transform import Rotation as R
 from PIL import Image
-from objects.object_attribute_inference import (
-    infer_attributes_from_claude
-)
 
 def load_pkl_gz(file_path):
     """Load a .pkl.gz file."""
@@ -48,15 +45,36 @@ def create_faces(triangles_data):
 
 ASSETS_VERSION = os.environ.get("ASSETS_VERSION", "2023_09_23")
 
+SAGE_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+REPO_OBJATHOR_DIR = os.path.join(SAGE_ROOT, "objathor")
+
+
+def _first_existing_path(*paths):
+    for path in paths:
+        if path and os.path.exists(path):
+            return path
+    return paths[0]
+
 OBJATHOR_ASSETS_BASE_DIR = os.environ.get(
     "OBJATHOR_ASSETS_BASE_DIR", os.path.expanduser(f"~/.objathor-assets")
 )
 
 OBJATHOR_VERSIONED_DIR = os.path.join(OBJATHOR_ASSETS_BASE_DIR, ASSETS_VERSION)
 
-OBJATHOR_FEATURES_DIR = os.path.join(OBJATHOR_VERSIONED_DIR, "features")
-OBJATHOR_ANNOTATIONS_PATH = os.path.join(OBJATHOR_VERSIONED_DIR, "annotations.json.gz")
-OBJATHOR_ASSETS_DIR = os.path.join(OBJATHOR_VERSIONED_DIR, "assets")
+OBJATHOR_FEATURES_DIR = os.environ.get("OBJATHOR_FEATURES_DIR") or _first_existing_path(
+    os.path.join(OBJATHOR_VERSIONED_DIR, "features"),
+    os.path.join(REPO_OBJATHOR_DIR, "features"),
+    os.path.join(REPO_OBJATHOR_DIR, ASSETS_VERSION, "thor_object_data"),
+)
+OBJATHOR_ANNOTATIONS_PATH = os.environ.get("OBJATHOR_ANNOTATIONS_PATH") or _first_existing_path(
+    os.path.join(OBJATHOR_VERSIONED_DIR, "annotations.json.gz"),
+    os.path.join(REPO_OBJATHOR_DIR, "annotations.json.gz"),
+    os.path.join(REPO_OBJATHOR_DIR, ASSETS_VERSION, "thor_object_data", "annotations.json.gz"),
+)
+OBJATHOR_ASSETS_DIR = os.environ.get("OBJATHOR_ASSETS_DIR") or _first_existing_path(
+    os.path.join(OBJATHOR_VERSIONED_DIR, "assets"),
+    os.path.join(REPO_OBJATHOR_DIR, "assets", "assets"),
+)
 
 
 def get_asset_metadata(obj_data: Dict[str, Any]):
@@ -251,6 +269,7 @@ class ObjathorRetriever:
         }
     
         if infer_attributes:
+            from objects.object_attribute_inference import infer_attributes_from_claude
 
             # scale_factor = infer_scale_from_reason1(mesh_dict, caption=caption)
             object_attributes = infer_attributes_from_claude(mesh_dict, caption=caption)
@@ -264,13 +283,3 @@ class ObjathorRetriever:
         mesh_dict["mesh"].vertices[:, 2] = mesh_dict["mesh"].vertices[:, 2] + 0.001
 
         return mesh_dict
-
-        
-        
-
-
-
-
-
-
-        

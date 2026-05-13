@@ -18,7 +18,7 @@ import time
 import random
 import threading
 from datetime import datetime
-from key import ANTHROPIC_API_KEY, API_TOKEN, API_URL_DICT, MODEL_DICT
+from key import ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, API_TOKEN, API_URL_DICT, MODEL_DICT
 import anthropic
 from constants import SERVER_ROOT_DIR
 try:
@@ -507,7 +507,10 @@ def _call_claude_with_retry(
     max_retries, retry_base_delay, retry_max_delay
 ):
     """Call Claude API with retry logic."""
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    client_kwargs = {"api_key": ANTHROPIC_API_KEY}
+    if ANTHROPIC_BASE_URL:
+        client_kwargs["base_url"] = ANTHROPIC_BASE_URL
+    client = anthropic.Anthropic(**client_kwargs)
     
     # Import here to avoid circular import
     from layout import get_mcp_init_id

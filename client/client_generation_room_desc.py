@@ -398,9 +398,8 @@ class MCPClientOAI:
         self.layout_id = None
         
         # Initialize OpenAI client with Qwen3-VL endpoint
-        key_dict_path = "./key.json"
-        with open(key_dict_path, 'r') as f:
-            key_dict = json.load(f)
+        from env_config import load_client_config
+        key_dict = load_client_config()
 
         API_TOKEN = key_dict["API_TOKEN"]
         API_URL_QWEN = key_dict["API_URL_QWEN"]
@@ -737,12 +736,12 @@ class MCPClientOAI:
                 if is_python:
                     # Run Python scripts with conda environment and required env vars
                     import os
+                    import shlex
                     abs_script_path = os.path.abspath(server_script_path)
+                    conda_env_name = os.environ.get("CONDA_ENV_NAME", "sage")
                     
                     # Create a bash command that sets up conda env and runs the script
-                    bash_command = (
-                        f"source ~/.bashrc && "
-                        f"conda activate simgen && "
+                    server_command = (
                         f"cd {SERVER_DIR} && "
                         f"export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH && "
                         f"export LIBRARY_PATH=$CONDA_PREFIX/lib:$LIBRARY_PATH && "
@@ -753,6 +752,10 @@ class MCPClientOAI:
                         f"export SEMANTIC_CRITIC_ENABLED={os.environ.get('SEMANTIC_CRITIC_ENABLED', 'true')} && "
                         f"export SLURM_JOB_ID={os.environ.get('SLURM_JOB_ID')} && "
                         f"python {abs_script_path}"
+                    )
+                    bash_command = (
+                        f"/home/gaok/anaconda3/bin/conda run -n {shlex.quote(conda_env_name)} "
+                        f"--no-capture-output bash -c {shlex.quote(server_command)}"
                     )
                     
                     command = "bash"
@@ -1034,14 +1037,14 @@ class MCPClientOAI:
                 call_params = {
                     "model": self.MODEL_NAME,
                     "messages": messages_for_api,
-                    "max_tokens": 40960,
+                    "max_tokens": 32768,
                     "temperature": 1.0,
                 }
                 
                 # Only add tools if we have any
                 if available_tools:
                     call_params["tools"] = available_tools
-                    call_params["tool_choice"] = "none"  # Let the model decide when to use tools
+                    call_params["tool_choice"] = "auto"  # Let the model decide when to use tools
                     print(f"🛠️  Available tools: {len(available_tools)}")
                 
                 # Retry mechanism with exponential backoff (for API errors)

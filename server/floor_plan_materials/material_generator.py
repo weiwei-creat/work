@@ -14,26 +14,75 @@
 # limitations under the License.
 from constants import MATFUSE_ROOT_DIR
 import os
-# Use importlib.util to import a function named generate_texture_map_from_prompt from the generate.py file in MATFUSE_ROOT_DIR
 import importlib.util
 import sys
 import random
-# Create the full path to the generate.py file
-generate_py_path = os.path.join(MATFUSE_ROOT_DIR, "generate.py")
+from PIL import Image
 
-# Load the module from the file path
-spec = importlib.util.spec_from_file_location("generate_module", generate_py_path)
-generate_module = importlib.util.module_from_spec(spec)
-sys.modules["generate_module"] = generate_module
-spec.loader.exec_module(generate_module)
+_generate_module = None
 
-# Import the specific function
-generate_texture_map_from_prompt = generate_module.generate_texture_map_from_prompt
-generate_texture_map_from_prompt_and_sketch = generate_module.generate_texture_map_from_prompt_and_sketch
-generate_texture_map_from_prompt_and_sketch_and_image = generate_module.generate_texture_map_from_prompt_and_sketch_and_image
-generate_texture_map_from_prompt_and_color = generate_module.generate_texture_map_from_prompt_and_color
-generate_texture_map_from_prompt_and_color_and_sketch = generate_module.generate_texture_map_from_prompt_and_color_and_sketch
-generate_texture_map_from_prompt_and_color_palette = generate_module.generate_texture_map_from_prompt_and_color_palette
+
+def _matfuse_disabled():
+    return os.environ.get("SAGE_DISABLE_MATFUSE", "0").lower() in {"1", "true", "yes", "on"}
+
+
+def _placeholder_texture(color=(192, 192, 192)):
+    return Image.new("RGB", (512, 512), color)
+
+
+def _load_generate_module():
+    global _generate_module
+    if _generate_module is None:
+        generate_py_path = os.path.join(MATFUSE_ROOT_DIR, "generate.py")
+        spec = importlib.util.spec_from_file_location("generate_module", generate_py_path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["generate_module"] = module
+        spec.loader.exec_module(module)
+        _generate_module = module
+    return _generate_module
+
+
+def generate_texture_map_from_prompt(prompt):
+    if _matfuse_disabled():
+        return _placeholder_texture()
+    return _load_generate_module().generate_texture_map_from_prompt(prompt)
+
+
+def generate_texture_map_from_prompt_and_sketch(prompt, sketch):
+    if _matfuse_disabled():
+        return _placeholder_texture()
+    return _load_generate_module().generate_texture_map_from_prompt_and_sketch(prompt, sketch)
+
+
+def generate_texture_map_from_prompt_and_sketch_and_image(prompt, sketch, image):
+    if _matfuse_disabled():
+        return _placeholder_texture()
+    return _load_generate_module().generate_texture_map_from_prompt_and_sketch_and_image(prompt, sketch, image)
+
+
+def generate_texture_map_from_prompt_and_color(prompt, color):
+    if _matfuse_disabled():
+        rgb = tuple(int(max(0, min(1, c)) * 255) for c in color[:3])
+        return _placeholder_texture(rgb)
+    return _load_generate_module().generate_texture_map_from_prompt_and_color(prompt, color)
+
+
+def generate_texture_map_from_prompt_and_color_and_sketch(prompt, color, sketch):
+    if _matfuse_disabled():
+        rgb = tuple(int(max(0, min(1, c)) * 255) for c in color[:3])
+        return _placeholder_texture(rgb)
+    return _load_generate_module().generate_texture_map_from_prompt_and_color_and_sketch(prompt, color, sketch)
+
+
+def generate_texture_map_from_prompt_and_color_palette(prompt, color_palette):
+    if _matfuse_disabled():
+        if color_palette:
+            color = color_palette[0]
+            rgb = tuple(int(max(0, min(1, c)) * 255) for c in color[:3])
+        else:
+            rgb = (192, 192, 192)
+        return _placeholder_texture(rgb)
+    return _load_generate_module().generate_texture_map_from_prompt_and_color_palette(prompt, color_palette)
 
 def material_generate_from_prompt(prompts):
     results = []

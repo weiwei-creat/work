@@ -41,14 +41,20 @@ def init_sbert():
 
 
 
-clip_model, clip_preprocess, clip_tokenizer = init_clip()
-sbert_model = init_sbert()
+clip_model = None
+clip_preprocess = None
+clip_tokenizer = None
+sbert_model = None
 
 
 def get_clip_models():
     global clip_model, clip_preprocess, clip_tokenizer
+    if clip_model is None or clip_preprocess is None or clip_tokenizer is None:
+        clip_model, clip_preprocess, clip_tokenizer = init_clip()
     return clip_model, clip_preprocess, clip_tokenizer
 
 def get_sbert_model():
     global sbert_model
+    if sbert_model is None:
+        sbert_model = init_sbert()
     return sbert_model

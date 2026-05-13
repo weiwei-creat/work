@@ -17,33 +17,113 @@ import uuid
 import tempfile
 import time
 import random
+import re
 from models import Room, Object
 import trimesh
-# from .objaverse_retrieval import ObjathorRetriever
-from .object_generation import generate_model_from_text
-from .object_attribute_inference import infer_attributes_from_claude
+from .objaverse_retrieval import ObjathorRetriever, OBJATHOR_ANNOTATIONS_PATH
 from foundation_models import get_clip_models, get_sbert_model
 import sys
 import numpy as np
 from constants import RESULTS_DIR
-clip_model, clip_preprocess, clip_tokenizer = get_clip_models()
-sbert_model = get_sbert_model()
 
-# def init_retrieval_objaverse(clip_model, clip_preprocess, clip_tokenizer, sbert_model):
+object_retriever_objaverse = None
+object_retriever_objathor_text = None
 
-#     # initialize generation
-#     retrieval_threshold = 28
-#     object_retriever = ObjathorRetriever(
-#         clip_model=clip_model,
-#         clip_preprocess=clip_preprocess,
-#         clip_tokenizer=clip_tokenizer,
-#         sbert_model=sbert_model,
-#         retrieval_threshold=retrieval_threshold,
-#     )
 
-#     return object_retriever
+def _env_bool(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
 
-# object_retriever_objaverse = init_retrieval_objaverse(clip_model, clip_preprocess, clip_tokenizer, sbert_model)
+
+def trellis_generation_enabled():
+    if "SAGE_ENABLE_TRELLIS_GENERATION" in os.environ:
+        return _env_bool("SAGE_ENABLE_TRELLIS_GENERATION")
+    if "SAGE_DISABLE_TRELLIS" in os.environ:
+        return not _env_bool("SAGE_DISABLE_TRELLIS")
+    return False
+
+
+def init_retrieval_objaverse():
+    clip_model, clip_preprocess, clip_tokenizer = get_clip_models()
+    sbert_model = get_sbert_model()
+    retrieval_threshold = int(os.environ.get("SAGE_OBJATHOR_RETRIEVAL_THRESHOLD", "28"))
+    return ObjathorRetriever(
+        clip_model=clip_model,
+        clip_preprocess=clip_preprocess,
+        clip_tokenizer=clip_tokenizer,
+        sbert_model=sbert_model,
+        retrieval_threshold=retrieval_threshold,
+    )
+
+
+def get_objathor_retriever():
+    global object_retriever_objaverse
+    if object_retriever_objaverse is None:
+        print("Initializing Objathor retriever for existing-asset selection", file=sys.stderr)
+        object_retriever_objaverse = init_retrieval_objaverse()
+    return object_retriever_objaverse
+
+
+def _tokenize_text(value):
+    stopwords = {
+        "a", "an", "the", "of", "with", "and", "or", "for", "to", "in", "on",
+        "at", "by", "from", "model", "object", "3d", "small", "large", "medium",
+    }
+    return {
+        token for token in re.findall(r"[a-z0-9]+", str(value).lower())
+        if token not in stopwords and len(token) > 1
+    }
+
+
+def get_objathor_text_database():
+    global object_retriever_objathor_text
+    if object_retriever_objathor_text is None:
+        import compress_json
+        print(f"Loading Objathor annotations from {OBJATHOR_ANNOTATIONS_PATH}", file=sys.stderr)
+        object_retriever_objathor_text = compress_json.load(OBJATHOR_ANNOTATIONS_PATH)
+    return object_retriever_objathor_text
+
+
+def retrieve_objathor_by_text(object_type, object_description, object_location, object_size, max_num_candidates):
+    database = get_objathor_text_database()
+    query_tokens = _tokenize_text(f"{object_type} {object_description}")
+    location_key = {
+        "floor": "onFloor",
+        "wall": "onWall",
+        "ceiling": "onCeiling",
+        "object": "onObject",
+    }.get(str(object_location).lower())
+
+    scored = []
+    target_size = np.array(object_size, dtype=np.float32)
+    target_size = np.sort(target_size)
+
+    for asset_id, obj_data in database.items():
+        text = " ".join(
+            str(obj_data.get(key, ""))
+            for key in ("category", "ref_category", "description", "description_auto")
+        )
+        tokens = _tokenize_text(text)
+        overlap = len(query_tokens & tokens)
+
+        category = str(obj_data.get("category", "")).lower()
+        ref_category = str(obj_data.get("ref_category", "")).lower()
+        type_bonus = 4.0 if str(object_type).lower() in {category, ref_category} else 0.0
+        location_bonus = 1.0 if location_key and obj_data.get(location_key) else 0.0
+
+        asset_size = obj_data.get("size")
+        size_penalty = 0.0
+        if asset_size and len(asset_size) >= 3:
+            asset_size_array = np.sort(np.array(asset_size[:3], dtype=np.float32))
+            size_penalty = float(np.mean(np.abs(asset_size_array - target_size))) / 100.0
+
+        score = overlap + type_bonus + location_bonus - size_penalty
+        scored.append((asset_id, score))
+
+    scored.sort(key=lambda item: item[1], reverse=True)
+    return scored[:max_num_candidates]
 
 
 def rotate_wall_mesh(mesh_dict):
@@ -83,6 +163,8 @@ def rotate_wall_mesh(mesh_dict):
 
         # print(f"object_attributes: {mesh_dict['object_attributes']}", file=sys.stderr)
 
+        from .object_attribute_inference import infer_attributes_from_claude
+
         object_attributes = infer_attributes_from_claude(mesh_dict, caption=mesh_dict["object_attributes"]["given_caption"])
 
         mesh_dict["object_attributes"] = object_attributes
@@ -114,6 +196,9 @@ def rotate_wall_mesh(mesh_dict):
 
 def get_object_candidates(object_info: dict, source: str = "generation"):
     # now only support objaverse retrieval
+    if source == "generation" and not trellis_generation_enabled():
+        print("TRELLIS generation is disabled by config; using Objathor retrieval instead", file=sys.stderr)
+        source = "objaverse"
     
 
     object_type = object_info["type"]
@@ -127,16 +212,40 @@ def get_object_candidates(object_info: dict, source: str = "generation"):
     
     # global object_retriever_objaverse
 
-    if source == "objaverse": # disable in the code release.
-        object_retriever = object_retriever_objaverse
-        database = object_retriever.database
-        similarity_threshold_floor = 31
+    if source in {"objaverse", "objathor"}:
         caption = f"A 3D model of {object_type}, {object_description}"
-        candidates_retrieved = object_retriever.retrieve(
-            [caption],
-            similarity_threshold_floor,
-            max_num_candidates=3
-        )
+        retrieval_mode = os.environ.get("SAGE_OBJATHOR_RETRIEVAL_MODE", "embedding").lower()
+        if retrieval_mode == "embedding":
+            object_retriever = get_objathor_retriever()
+            similarity_thresholds = [
+                int(os.environ.get("SAGE_OBJATHOR_SIMILARITY_THRESHOLD", "31")),
+                28,
+                24,
+                0,
+            ]
+            candidates_retrieved = []
+            for similarity_threshold_floor in similarity_thresholds:
+                candidates_retrieved = object_retriever.retrieve(
+                    [caption],
+                    similarity_threshold_floor,
+                    max_num_candidates=max(3, int(object_info.get("quantity", 1)))
+                )
+                if candidates_retrieved:
+                    if similarity_threshold_floor != similarity_thresholds[0]:
+                        print(
+                            f"Objathor retrieval relaxed threshold to {similarity_threshold_floor} for: {caption}",
+                            file=sys.stderr,
+                        )
+                    break
+        else:
+            object_retriever = ObjathorRetriever.__new__(ObjathorRetriever)
+            candidates_retrieved = retrieve_objathor_by_text(
+                object_type,
+                object_description,
+                object_location,
+                object_size,
+                max_num_candidates=max(3, int(object_info.get("quantity", 1)))
+            )
 
         # candidates = [
         #     {
@@ -163,6 +272,8 @@ def get_object_candidates(object_info: dict, source: str = "generation"):
         return candidates
 
     elif source == "generation":
+        from .object_generation import generate_model_from_text
+
         # Generate unique ID for this object
         object_random_id = str(uuid.uuid4())[:8]
         

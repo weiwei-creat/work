@@ -49,6 +49,40 @@ import torch
 from pytorch3d.io import save_obj
 
 
+def _skip_object_render_analysis():
+    return os.environ.get("SAGE_SKIP_OBJECT_RENDER_ANALYSIS", "0").lower() in {"1", "true", "yes", "on"}
+
+
+def _fallback_object_attributes(caption, reference_object_size=None):
+    if reference_object_size is not None and len(reference_object_size) >= 3:
+        width = float(reference_object_size[0]) / 100.0
+        length = float(reference_object_size[1]) / 100.0
+        height = float(reference_object_size[2]) / 100.0
+    else:
+        width = length = height = 1.0
+
+    return {
+        "long_caption": caption or "generated object",
+        "short_caption": caption or "generated object",
+        "given_caption": caption or "",
+        "semantic_alignment": True,
+        "name": "generated object",
+        "explanation": "Object render analysis was skipped; dimensions come from the requested object size.",
+        "width": width,
+        "length": length,
+        "height": height,
+        "dimension_ordering_check": "skipped",
+        "weight": max(1.0, width * length * height * 20.0),
+        "scale_unit": "meter",
+        "weight_unit": "kilogram",
+        "pbr_parameters": {
+            "explanation": "Default PBR parameters used when render analysis is skipped.",
+            "metallic": 0.0,
+            "roughness": 0.5,
+        },
+    }
+
+
 
 class TrellisClient:
     def __init__(self, server_url=SERVER_URL):
@@ -361,26 +395,51 @@ def extract_max_connected_component(mesh_dict):
     
     
 
-# Initialize client
-client = TrellisClient()
+client = None
 
-# Check server health
-health = client.health_check()
-if health:
-    print("✓ Server is running and healthy", file=sys.stderr)
-    print(f"GPU available: {health.get('gpu_available', 'Unknown')}", file=sys.stderr)
-else:
-    print("✗ Cannot connect to server. Make sure it's running and SSH tunnel is active.", file=sys.stderr)
-    
+
+def _env_bool(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def trellis_generation_enabled():
+    if "SAGE_ENABLE_TRELLIS_GENERATION" in os.environ:
+        return _env_bool("SAGE_ENABLE_TRELLIS_GENERATION")
+    if "SAGE_DISABLE_TRELLIS" in os.environ:
+        return not _env_bool("SAGE_DISABLE_TRELLIS")
+    return False
+
+
+def get_trellis_client():
+    global client
+    if client is None:
+        client = TrellisClient()
+        health = client.health_check()
+        if health:
+            print("✓ Server is running and healthy", file=sys.stderr)
+            print(f"GPU available: {health.get('gpu_available', 'Unknown')}", file=sys.stderr)
+        else:
+            print("✗ Cannot connect to server. Make sure it's running and SSH tunnel is active.", file=sys.stderr)
+    return client
+
 
 
 def generate_model_from_text(input_text, output_path, reference_object_size=None, estimate_front=True):
+    if not trellis_generation_enabled():
+        raise RuntimeError(
+            "TRELLIS generation is disabled by config. Set "
+            "SAGE_ENABLE_TRELLIS_GENERATION=1 and SAGE_OBJECT_SOURCE=generation "
+            "to use TRELLIS."
+        )
     
     # Example usage
     # input_text = "A model of nightstand with two layers of drawers."
     
     # Generate just the GLB file (downloaded to local machine)
-    success = client.generate_model(
+    success = get_trellis_client().generate_model(
         input_text=input_text,
         seed=random.randint(0, 1000000),
         output_file=output_path
@@ -409,25 +468,33 @@ def generate_model_from_text(input_text, output_path, reference_object_size=None
         mesh.faces = mesh.faces[:, [0, 2, 1]].copy()
         mesh_dict["tex_coords"]["fts"] = mesh_dict["tex_coords"]["fts"][:, [0, 2, 1]].copy()
 
-        if estimate_front:
+        skip_render_analysis = _skip_object_render_analysis()
+
+        if estimate_front and not skip_render_analysis:
             mesh_dict = estimate_front_from_mesh(mesh_dict)
 
-        height_list = []
-        width_list = []
-        length_list = []
-        num_inference_height = 3
-        for _ in range(num_inference_height):
-            object_attributes = infer_attributes_from_claude(mesh_dict, caption=input_text)
-            height_list.append(object_attributes["height"])
-            width_list.append(object_attributes["width"])
-            length_list.append(object_attributes["length"])
+        if skip_render_analysis:
+            object_attributes = _fallback_object_attributes(input_text, reference_object_size)
+            height_mean = object_attributes["height"]
+            width_mean = object_attributes["width"]
+            length_mean = object_attributes["length"]
+        else:
+            height_list = []
+            width_list = []
+            length_list = []
+            num_inference_height = 3
+            for _ in range(num_inference_height):
+                object_attributes = infer_attributes_from_claude(mesh_dict, caption=input_text)
+                height_list.append(object_attributes["height"])
+                width_list.append(object_attributes["width"])
+                length_list.append(object_attributes["length"])
 
-        height_mean = float(np.mean(np.array(height_list)))
-        object_attributes["height"] = height_mean
-        width_mean = float(np.mean(np.array(width_list)))
-        object_attributes["width"] = width_mean
-        length_mean = float(np.mean(np.array(length_list)))
-        object_attributes["length"] = length_mean
+            height_mean = float(np.mean(np.array(height_list)))
+            object_attributes["height"] = height_mean
+            width_mean = float(np.mean(np.array(width_list)))
+            object_attributes["width"] = width_mean
+            length_mean = float(np.mean(np.array(length_list)))
+            object_attributes["length"] = length_mean
 
         mesh_dict["object_attributes"] = object_attributes
 
