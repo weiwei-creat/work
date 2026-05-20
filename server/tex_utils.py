@@ -21,6 +21,7 @@ import xatlas
 from typing import Dict
 from constants import RESULTS_DIR
 from material_fallbacks import ensure_material_file
+from physics_metadata import get_layout_physics_metadata, rule_mass, rule_static_object
 
 def dict_to_room(room_data: dict) -> Room:
     """
@@ -332,6 +333,14 @@ def _align_wall_mounted_mesh_axes(mesh: trimesh.Trimesh) -> None:
 def _is_wall_mounted_place_id(place_id: str) -> bool:
     place_id = (place_id or "").lower()
     return place_id == "wall" or place_id.startswith("wall")
+
+
+def _is_robot_task_static_object(obj) -> bool:
+    return rule_static_object(obj)
+
+
+def _robot_task_mass(obj) -> float:
+    return rule_mass(obj)
 
 
 def _wall_map(room: Room) -> Dict[str, Wall]:
@@ -1044,6 +1053,8 @@ def export_layout_to_mesh_dict_list(layout: FloorPlan):
                     "texture": window_texture
                 }
             
+    physics_metadata = get_layout_physics_metadata(layout)
+
     # Process each room
     for room in layout.rooms:
         # Create object meshes with transforms
@@ -1056,8 +1067,10 @@ def export_layout_to_mesh_dict_list(layout: FloorPlan):
 
                 mesh_info_dict[obj.id] = {
                     "mesh": transformed_mesh,
-                    "static": False,
-                    "texture": texture_info
+                    "static": physics_metadata.get(obj.id, {}).get("static", _is_robot_task_static_object(obj)),
+                    "texture": texture_info,
+                    "mass": physics_metadata.get(obj.id, {}).get("mass", _robot_task_mass(obj)),
+                    "physics_metadata": physics_metadata.get(obj.id, {}),
                 }
 
 

@@ -383,7 +383,7 @@ def get_default_camera_view():
     return [0., 0., 0.], [1., 0., 0.]
 
 def get_default_base_pos():
-    return [0., 0., 0.]
+    return [0., 0., 0.07]
 
 def get_action_relative(ee_frame_pos, ee_frame_quat, target_ee_pos, target_ee_quat):
     d_rotvec = math_utils.axis_angle_from_quat(math_utils.quat_unique(math_utils.quat_mul(target_ee_quat, math_utils.quat_inv(ee_frame_quat))))
@@ -3614,7 +3614,7 @@ def main():
 
                 robot.write_joint_state_to_sim(joint_pos, joint_vel)
 
-                robot_base_pos = torch.tensor([0., 0., 0.01], device=sim.device).reshape(1, 3).repeat(num_envs, 1)
+                robot_base_pos = torch.tensor([0., 0., 0.07], device=sim.device).reshape(1, 3).repeat(num_envs, 1)
                 robot_base_quat = torch.tensor([1, 0, 0, 0], device=sim.device).reshape(1, 4).repeat(num_envs, 1)
 
                 base_w = torch.zeros(num_envs, 13).to(sim.device)

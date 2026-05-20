@@ -1564,6 +1564,7 @@ class MCPExtension(omni.ext.IExt):
                 rigid_object_property_dict[rigid_object_id] = {
                     "static": mesh_info_dict[rigid_object_id]['static'],
                     "mass": mesh_info_dict[rigid_object_id]['mass'],
+                    **mesh_info_dict[rigid_object_id].get("physics_metadata", {}),
                 }
                 rigid_object_transform_dict[rigid_object_id] = mesh_info_dict[rigid_object_id]["transform"]
 
@@ -1649,6 +1650,7 @@ class MCPExtension(omni.ext.IExt):
                 rigid_object_property_dict[rigid_object_id] = {
                     "static": mesh_info_dict[rigid_object_id]['static'],
                     "mass": mesh_info_dict[rigid_object_id]['mass'],
+                    **mesh_info_dict[rigid_object_id].get("physics_metadata", {}),
                 }
                 rigid_object_transform_dict[rigid_object_id] = mesh_info_dict[rigid_object_id]["transform"]
                 mesh_info_dict[rigid_object_id]['static'] = False

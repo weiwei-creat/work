@@ -167,14 +167,14 @@ MOBILE_FRANKA_PANDA_CFG = ArticulationCfg(
     actuators={
         "mobile_base": ImplicitActuatorCfg(
             joint_names_expr=["base_joint_mobile_side", "base_joint_mobile_forward"],
-            velocity_limit=30.0,
+            velocity_limit=2.0,
             effort_limit=50000.0,
             stiffness=10000.0,
             damping=1000.0,
         ),
         "mobile_base_rotate": ImplicitActuatorCfg(
             joint_names_expr=["base_joint_mobile_yaw"],
-            velocity_limit=30.0,
+            velocity_limit=2.0,
             effort_limit=50000.0,
             stiffness=10000.0,
             damping=2000.0,
@@ -195,14 +195,14 @@ MOBILE_FRANKA_PANDA_CFG = ArticulationCfg(
             effort_limit=200.0,
             velocity_limit=2.175,
             stiffness=1000.0,
-            damping=8.0,
+            damping=80.0,
         ),
         "panda_forearm": ImplicitActuatorCfg(
             joint_names_expr=["arm_joint[5-7]"],
             effort_limit=200.0,
             velocity_limit=2.61,
             stiffness=1000.0,
-            damping=8.0,
+            damping=80.0,
         ),
         "finger": ImplicitActuatorCfg(
             joint_names_expr=["gripper_finger_joint.*"],

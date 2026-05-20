@@ -52,6 +52,7 @@ class RobotMobileManipulationObjSceneEnvCfg(joint_pos_env_cfg.RobotMobileManipul
             body_name="base_fixed_support",
             controller=DifferentialIKControllerCfg(command_type="pose", use_relative_mode=True, ik_method="dls"),
             body_offset=DifferentialInverseKinematicsActionCfg.OffsetCfg(pos=[0.0, 0.0, 0.]),
+            scale=(0.5, 0.5, 0.0, 0.0, 0.0, 0.5),
         )
 
         self.actions.arm_action = DifferentialInverseKinematicsActionCfg(

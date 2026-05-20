@@ -123,10 +123,19 @@ class RobotMobileManipulationObjSceneEnvCfg(MobileManipulationObjSceneEnvCfg):
 
 
         def get_mass(object_name):
-            mass = mass_dict.get(object_name, None).get("mass", None)
+            object_props = mass_dict.get(object_name) or {}
+            mass = object_props.get("mass", 1.0)
+            if mass is None or mass <= 0:
+                mass = 1.0
             print(f"[DEBUG] object_name: {object_name}, mass: {mass}")
-            # mass = mass * 0.2
-            return mass
+            return float(mass)
+
+        def get_physics_property(object_name, key, default):
+            object_props = mass_dict.get(object_name) or {}
+            value = object_props.get(key, default)
+            if value is None:
+                return default
+            return value
 
         usd_collection_dir = env_cfg.get("usd_collection_dir", f"{scene_save_dir}/usd_collection")
         print(f"[DEBUG] usd_collection_dir: {usd_collection_dir}")
@@ -476,23 +485,25 @@ class RobotMobileManipulationObjSceneEnvCfg(MobileManipulationObjSceneEnvCfg):
                             spawn=sim_utils.UsdFileCfg(
                                 usd_path=f"{usd_collection_dir}/{usd_file_name}",
                                 rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                                    # ADD/INCREASE these for stability:
-                                    disable_gravity=False,
-                                    linear_damping=1e5,
-                                    angular_damping=1e5,
-                                    
-                                    # REDUCE these to prevent bouncing:
-                                    max_linear_velocity=0.5,    # Current: 1.0 - much too high for grasping
-                                    max_angular_velocity=0.5,   # Current: 1.0 - much too high for grasping 
-                                    max_depenetration_velocity=50.0,  # Current: not set - add this limit
+                                    kinematic_enabled=True,
+                                    disable_gravity=True,
+                                    linear_damping=0.0,
+                                    angular_damping=0.0,
+                                    max_linear_velocity=10.0,
+                                    max_angular_velocity=720.0,
+                                    max_depenetration_velocity=2.0,
                                     
                                     # INCREASE solver iterations for better contact stability:
                                     solver_position_iteration_count=16,  # Current: 16 - double it
-                                    solver_velocity_iteration_count=1,   # Current: 1 - increase
+                                    solver_velocity_iteration_count=4,
                                 ),
                                 # mass_props=sim_utils.MassPropertiesCfg(mass=1000.0 if "rubiks" not in usd_file_name else 0.10),
                                 mass_props=sim_utils.MassPropertiesCfg(mass=get_mass(os.path.splitext(usd_file_name)[0])),
-                                # physics_material=sim_utils.RigidBodyMaterialCfg(),
+                                physics_material=sim_utils.RigidBodyMaterialCfg(
+                                    static_friction=float(get_physics_property(os.path.splitext(usd_file_name)[0], "static_friction", 1.0)),
+                                    dynamic_friction=float(get_physics_property(os.path.splitext(usd_file_name)[0], "dynamic_friction", 0.8)),
+                                    restitution=float(get_physics_property(os.path.splitext(usd_file_name)[0], "restitution", 0.0)),
+                                ),
                                 collision_props=sim_utils.CollisionPropertiesCfg(
                                     collision_enabled=True,
                                     contact_offset=0.005,       # Increase from 0.001 to 0.005
@@ -512,22 +523,23 @@ class RobotMobileManipulationObjSceneEnvCfg(MobileManipulationObjSceneEnvCfg):
                             spawn=sim_utils.UsdFileCfg(
                                 usd_path=f"{usd_collection_dir}/{usd_file_name}",
                                 rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                                    # ADD/INCREASE these for stability:
-                                    linear_damping=10.0,        # Current: 20.0 - try reducing to 5.0-15.0  
-                                    angular_damping=10.0,       # Current: 20.0 - try reducing to 5.0-15.0
-                                    
-                                    # REDUCE these to prevent bouncing:
-                                    max_linear_velocity=5.0,    # Current: 1.0 - much too high for grasping
-                                    max_angular_velocity=5.0,   # Current: 1.0 - much too high for grasping 
-                                    max_depenetration_velocity=500.0,  # Current: not set - add this limit
+                                    linear_damping=0.05,
+                                    angular_damping=0.05,
+                                    max_linear_velocity=10.0,
+                                    max_angular_velocity=720.0,
+                                    max_depenetration_velocity=5.0,
                                     
                                     # INCREASE solver iterations for better contact stability:
                                     solver_position_iteration_count=16,  # Current: 16 - double it
-                                    solver_velocity_iteration_count=1,   # Current: 1 - increase
+                                    solver_velocity_iteration_count=4,
                                 ),
                                 # mass_props=sim_utils.MassPropertiesCfg(mass=1000.0 if "rubiks" not in usd_file_name else 0.10),
                                 mass_props=sim_utils.MassPropertiesCfg(mass=get_mass(os.path.splitext(usd_file_name)[0])),
-                                # physics_material=sim_utils.RigidBodyMaterialCfg(),
+                                physics_material=sim_utils.RigidBodyMaterialCfg(
+                                    static_friction=float(get_physics_property(os.path.splitext(usd_file_name)[0], "static_friction", 0.9)),
+                                    dynamic_friction=float(get_physics_property(os.path.splitext(usd_file_name)[0], "dynamic_friction", 0.7)),
+                                    restitution=float(get_physics_property(os.path.splitext(usd_file_name)[0], "restitution", 0.0)),
+                                ),
                                 collision_props=sim_utils.CollisionPropertiesCfg(
                                     collision_enabled=True,
                                     contact_offset=0.005,       # Increase from 0.001 to 0.005

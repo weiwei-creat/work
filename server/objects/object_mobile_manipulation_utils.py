@@ -310,11 +310,11 @@ class CollisionCheckingConfig:
     # Grid and distance parameters - use the most conservative values
     GRID_RES = 0.05  # Fine resolution for accuracy
     ROBOT_MIN_DIST_TO_ROOM_EDGE = 0.5  # Conservative room edge distance
-    ROBOT_MIN_DIST_TO_OBJECT = 0.40  # Conservative object distance (max from all functions)
+    ROBOT_MIN_DIST_TO_OBJECT = 0.50  # Conservative object distance for the full mobile base footprint
     
     # Robot occupancy parameters - use most conservative settings
     ROBOT_OCCUPANCY_OFFSET = 0.05  # Conservative robot size offset
-    ROBOT_SPAWN_OCCUPANCY_OFFSET = 0.40  # Stricter offset for spawn collision checking
+    ROBOT_SPAWN_OCCUPANCY_OFFSET = 0.50  # Stricter offset for spawn collision checking
     
     # Collision checking parameters
     CHECK_RANGE = 0.5  # Range around robot center to check for collisions
@@ -328,6 +328,35 @@ class CollisionCheckingConfig:
     # Place location sampling parameters
     MIN_DIST_TO_BOUNDARY = 0.2   # Minimum distance from place location to table boundary
     MAX_DIST_TO_OBJECT = 0.8      # Maximum distance from robot to place location for feasibility
+
+
+def _fallback_spawn_positions(valid_points, occupancy_grid, grid_x, grid_y, room_bounds, num_envs):
+    """Pick the safest sampled points instead of falling back to the room center."""
+    room_min_x, room_min_y, _, _ = room_bounds
+    if len(valid_points) == 0:
+        return np.empty((0, 2))
+
+    occupied_indices = np.where(occupancy_grid)
+    if len(occupied_indices[0]) == 0:
+        scores = np.ones(len(valid_points))
+    else:
+        occupied_positions = np.column_stack([
+            room_min_x + occupied_indices[0] * CollisionCheckingConfig.GRID_RES + CollisionCheckingConfig.GRID_RES / 2,
+            room_min_y + occupied_indices[1] * CollisionCheckingConfig.GRID_RES + CollisionCheckingConfig.GRID_RES / 2,
+        ])
+        scores = []
+        batch_size = 1000
+        for i in range(0, len(valid_points), batch_size):
+            batch_points = valid_points[i:i + batch_size]
+            distances = np.linalg.norm(
+                batch_points[:, np.newaxis, :] - occupied_positions[np.newaxis, :, :],
+                axis=2,
+            )
+            scores.append(np.min(distances, axis=1))
+        scores = np.concatenate(scores, axis=0)
+
+    selected = np.argsort(scores)[::-1][:max(num_envs, 1)]
+    return valid_points[selected]
 
 
 def create_unified_occupancy_grid(scene_save_dir, layout_name, room_id, only_floor=True, return_idx=False):
@@ -2188,10 +2217,31 @@ def sample_robot_spawn(
         print(f"Found {len(collision_free_positions)} collision-free robot spawn positions out of {len(valid_points)} candidates")
         
         if len(collision_free_positions) == 0:
-            print("Warning: No collision-free robot spawn positions found, using room center")
-            room_center = [(room_min_x + room_max_x) / 2, (room_min_y + room_max_y) / 2]
-            spawn_positions = np.array([room_center] * num_envs)
-            spawn_angles = np.zeros((num_envs, 1))
+            print("Warning: No collision-free robot spawn positions found, using safest sampled spawn candidates")
+            fallback_positions = _fallback_spawn_positions(
+                valid_points, occupancy_grid, grid_x, grid_y, room_bounds, num_envs
+            )
+            if len(fallback_positions) == 0:
+                room_center = [(room_min_x + room_max_x) / 2, (room_min_y + room_max_y) / 2]
+                fallback_positions = np.array([room_center])
+            selected_positions = []
+            selected_angles = []
+            for i in range(num_envs):
+                candidate_point = fallback_positions[i % len(fallback_positions)]
+                best_yaw = 0.0
+                for yaw in np.linspace(-np.pi, np.pi, 16, endpoint=False):
+                    candidate_quat = np.array([np.cos(yaw / 2), 0, 0, np.sin(yaw / 2)])
+                    candidate_pos_3d = np.array([candidate_point[0], candidate_point[1], 0])
+                    if not check_unified_robot_collision(
+                        candidate_pos_3d, candidate_quat, scene_occupancy_fn, room_bounds,
+                        robot_occupancy_offset=CollisionCheckingConfig.ROBOT_OCCUPANCY_OFFSET,
+                    ):
+                        best_yaw = yaw
+                        break
+                selected_positions.append(candidate_point)
+                selected_angles.append(best_yaw)
+            spawn_positions = np.array(selected_positions)
+            spawn_angles = np.array(selected_angles).reshape(-1, 1)
         else:
             # Use collision-free positions
             if num_envs <= len(collision_free_positions):
