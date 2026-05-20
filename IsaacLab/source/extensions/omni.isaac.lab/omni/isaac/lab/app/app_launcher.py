@@ -20,10 +20,16 @@ import signal
 import sys
 from typing import Any, Literal
 
-with contextlib.suppress(ModuleNotFoundError):
+# Isaac Sim 5.x ships SimulationApp via the top-level ``isaacsim`` module which
+# sets up the Kit runtime before exposing the class.  Importing from the
+# deprecated ``omni.isaac.kit`` location skips that setup and triggers a
+# ``ModuleNotFoundError: No module named 'omni.kit.usd'``.
+try:
     import isaacsim  # noqa: F401
 
-from omni.isaac.kit import SimulationApp
+    from isaacsim import SimulationApp
+except ModuleNotFoundError:
+    from omni.isaac.kit import SimulationApp
 
 
 class AppLauncher:
@@ -550,6 +556,22 @@ class AppLauncher:
                 self._sim_experience_file = os.path.join(isaaclab_app_exp_path, "isaaclab.python.headless.kit")
             else:
                 self._sim_experience_file = os.path.join(isaaclab_app_exp_path, "isaaclab.python.kit")
+
+            # Isaac Sim 5.x: the IsaacLab kit files reference deprecated extension names
+            # (omni.isaac.kit, omni.isaac.cloner, etc.) that don't resolve.  Fall back
+            # to the Isaac Sim built-in experience file which ships with proper 5.x names.
+            if not os.path.isfile(self._sim_experience_file):
+                import carb
+                carb.log_warn(
+                    f"Isaac Lab experience file not found: {self._sim_experience_file}. "
+                    "Falling back to Isaac Sim built-in experience."
+                )
+                if self._headless and not self._livestream:
+                    fallback = os.path.join(kit_app_exp_path, "isaacsim.exp.base.python.kit")
+                else:
+                    fallback = os.path.join(kit_app_exp_path, "isaacsim.exp.base.python.kit")
+                if os.path.isfile(fallback):
+                    self._sim_experience_file = fallback
         elif not os.path.isabs(self._sim_experience_file):
             option_1_app_exp_path = os.path.join(kit_app_exp_path, self._sim_experience_file)
             option_2_app_exp_path = os.path.join(isaaclab_app_exp_path, self._sim_experience_file)
@@ -596,8 +618,9 @@ class AppLauncher:
         # remove Isaac Lab modules from sys.modules
         hacked_modules = dict()
         for key in found_modules:
-            hacked_modules[key] = sys.modules[key]
-            del sys.modules[key]
+            if key in sys.modules:
+                hacked_modules[key] = sys.modules[key]
+                del sys.modules[key]
 
         # disable sys stdout and stderr to avoid printing the warning messages
         # this is mainly done to purge the print statements from the simulation app
@@ -665,6 +688,9 @@ class AppLauncher:
         # when the render() method is called.
         carb_settings_iface.set_bool("/isaaclab/render/offscreen", self._offscreen_render)
 
+        # set carb setting to enable camera rendering when --enable_cameras is used
+        carb_settings_iface.set_bool("/isaaclab/cameras_enabled", self._enable_cameras)
+
         # set carb setting to indicate Isaac Lab's render_viewport pipeline should be enabled
         # this flag is used by the SimulationContext class to enable the render_viewport pipeline
         # when the render() method is called.
@@ -686,7 +712,8 @@ class AppLauncher:
         carb_settings_iface.set_string("/persistent/isaac/asset_root/nvidia", assets_path)
 
         # disable physics backwards compatibility check
-        carb_settings_iface.set_int(physx_impl.SETTING_BACKWARD_COMPATIBILITY, 0)
+        if hasattr(physx_impl, "SETTING_BACKWARD_COMPATIBILITY"):
+            carb_settings_iface.set_int(physx_impl.SETTING_BACKWARD_COMPATIBILITY, 0)
 
     def _hide_stop_button(self):
         """Hide the stop button in the toolbar.

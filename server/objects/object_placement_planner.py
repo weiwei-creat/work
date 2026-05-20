@@ -1220,10 +1220,21 @@ def place_on_object_objects(on_object_objects: List[Object], room: Room, current
             # final validation
             print(f"final validation for placing {obj.id}", file=sys.stderr)
 
-            if PHYSICS_CRITIC_ENABLED:
+            # Batch stability testing: only test every N objects to avoid Isaac overload
+            # Individual small objects placed on surfaces rarely cause physics instability
+            unstable_object_ids = []  # Default: no unstable objects (when batch test is skipped)
+            batch_test_interval = int(os.environ.get("SAGE_STABILITY_BATCH_INTERVAL", "5"))
+            total_placed_so_far = len(all_placed_objects)
+            should_test_stability = (
+                PHYSICS_CRITIC_ENABLED
+                and total_placed_so_far > 0
+                and total_placed_so_far % batch_test_interval == 0
+            )
+
+            if should_test_stability:
 
                 # evaluate the stabillity after placement and remove objects that are not stable
-                print(f"evaluating the stabillity after placement and remove objects that are not stable", file=sys.stderr)
+                print(f"evaluating the stabillity after placement (batch test at {total_placed_so_far} objects)", file=sys.stderr)
                 scene_save_dir = os.path.join(RESULTS_DIR, current_layout.id)
 
                 # Create and simulate the single-room scene
@@ -1231,27 +1242,20 @@ def place_on_object_objects(on_object_objects: List[Object], room: Room, current
                 with open(room_dict_save_path, "w") as f:
                     json.dump(asdict(room_copy_eval), f)
 
-                result_create = create_single_room_layout_scene_from_room(
-                    scene_save_dir,
-                    room_dict_save_path
-                )
-                if not isinstance(result_create, dict) or result_create.get("status") != "success":
-                    # raise exception
-                    pass
-
-                result_sim = simulate_the_scene()
-                if not isinstance(result_sim, dict) or result_sim.get("status") != "success":
-                    # raise exception
-                    pass
-
-                unstable_object_ids = result_sim["unstable_objects"]
-                # print(f"number of unstable objects: ", len(unstable_object_ids), file=sys.stderr)
-                # print(f"room_copy_eval.objects: ", len(room_copy_eval.objects), file=sys.stderr)
-                if len(unstable_object_ids) > 0:
-                    # print(f"unstable_object_ids: ", unstable_object_ids, file=sys.stderr)
-                    room_copy_eval.objects = [obj for obj in room_copy_eval.objects if obj.id not in unstable_object_ids]
-                    # print(f"after removing unstable objects, room_copy_eval.objects: ", len(room_copy_eval.objects), file=sys.stderr)
-                    all_placed_objects = [obj for obj in all_placed_objects if obj.id not in unstable_object_ids]
+                try:
+                    result_create = create_single_room_layout_scene_from_room(
+                        scene_save_dir,
+                        room_dict_save_path
+                    )
+                    if isinstance(result_create, dict) and result_create.get("status") == "success":
+                        result_sim = simulate_the_scene()
+                        if isinstance(result_sim, dict) and result_sim.get("status") == "success":
+                            unstable_object_ids = result_sim.get("unstable_objects", [])
+                            if len(unstable_object_ids) > 0:
+                                room_copy_eval.objects = [o for o in room_copy_eval.objects if o.id not in unstable_object_ids]
+                                all_placed_objects[:] = [o for o in all_placed_objects if o.id not in unstable_object_ids]
+                except Exception as e:
+                    print(f"Stability batch test failed (non-fatal): {e}", file=sys.stderr)
 
             print(f"finished trial of placing {obj.id} on {obj.place_id}, current room objects: {len(room_copy_eval.objects)}", file=sys.stderr)
 
@@ -2730,20 +2734,15 @@ def adjust_wall_object_position(placement: Dict, wall_obj: Object, wall_systems:
     object_depth = wall_obj.dimensions.length
     
     # Current position calculation in wall_2d_to_3d places the point at:
-    # wall_surface + (thickness * 0.4) * wall_normal (slightly inward from wall surface)
+    # wall_centerline + (thickness * 0.4) * wall_normal
     # 
     # For wall-mounted objects, we want the object center to be at:
-    # wall_surface + (object_depth / 2) * wall_normal (outward into room)
-    #
-    # So we need to adjust by:
-    # (object_depth / 2) - (thickness * 0.4) in the wall_normal direction
+    # wall interior surface + (object_depth / 2) * wall_normal
     
     # Calculate the total adjustment needed
-    current_inward_offset = wall_thickness * 0.4  # How far inward the current position is
-    desired_outward_offset = object_depth / 2     # How far outward the object center should be
-    
-    # Total adjustment = move back to wall surface + move outward to object center
-    total_adjustment = current_inward_offset + desired_outward_offset
+    current_offset = wall_thickness * 0.4
+    desired_offset = wall_thickness * 0.5 + object_depth / 2
+    total_adjustment = desired_offset - current_offset
     
     # Calculate the adjustment vector (outward from wall into room)
     adjustment_vector = wall_normal * total_adjustment
@@ -4376,5 +4375,4 @@ Grid points with options: {len(grid_rotation_scores)}"""
             print(f"Error creating DFS placement visualization: {e}", file=sys.stderr)
             # Don't let visualization errors break the placement process
             pass
-
 

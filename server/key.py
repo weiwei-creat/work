@@ -21,6 +21,10 @@ import os
 import time
 import hashlib
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from openai import OpenAI
 
 SERVER_DIR = Path(__file__).resolve().parent
 SAGE_ROOT = SERVER_DIR.parent
@@ -138,7 +142,6 @@ def slurm_job_id_to_port(job_id, port_start=8080, port_end=40000):
 
 import requests
 from loguru import logger
-from openai import OpenAI
 from requests.auth import HTTPBasicAuth
 
 TOKEN_VALIDITY_SECONDS = 4 * 60 * 60 - 60  # 4 hours minus an error threshold of 1 min
@@ -192,8 +195,10 @@ def get_client_api_key(api_service: str) -> str:
     return response.json()["access_token"]
 
 
-def setup_oai_client() -> OpenAI:
+def setup_oai_client() -> "OpenAI":
     """Set up corporate OpenAI client with an API key that needs to be refreshed every 4 hours"""
+    from openai import OpenAI
+
     last_client_refresh["oai"] = time.time()
     oai_api_key = get_client_api_key("oai")
 

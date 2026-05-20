@@ -13,3 +13,11 @@ tmp/
 results
 **/__pycache__/
 *.pyc
+# compiled binaries
+*.so
+# generated robot data
+robomimic_data/
+# m2t2 model checkpoint
+M2T2/m2t2.pth
+# trellis output
+outputs/

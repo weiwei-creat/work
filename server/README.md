@@ -2,6 +2,34 @@
 
 此仓库包含 MCP 场景生成管线的服务端实现。
 
+## 0. 环境选择
+
+SAGE 提供以下 conda 环境，根据你的 GPU 选择：
+
+| 环境 | PyTorch | CUDA | Python | Isaac Sim | 适用 GPU |
+|------|---------|------|--------|-----------|----------|
+| `env_isaaclab` | 2.8.0+cu128 | 12.8 | 3.11 | 5.1（直接启动） | RTX 5080 (Blackwell) |
+| `sage` | 2.5.1+cu124 | 12.4 | 3.10 | —（仅 MCP 客户端） | RTX 30/40 系列 |
+| `sage5080` | 2.5.1+cu124 | 12.4 | 3.10 | —（仅 MCP 客户端） | RTX 5080（MCP 客户端） |
+
+**关键区别**：
+- `env_isaaclab` 是 IsaacLab 数据生成的**唯一可用环境**（需要 Python 3.11 + PyTorch 2.8+）
+- `sage` / `sage5080` 仅用于 MCP 客户端（场景生成），不直接启动 Isaac Sim
+
+### 配置 env_isaaclab（IsaacLab 数据生成）
+
+```bash
+conda activate env_isaaclab
+
+# IsaacLab 扩展安装（首次）
+pip install -e /home/gaok/coding/sage/IsaacLab/source/extensions/omni.isaac.lab
+pip install -e /home/gaok/coding/sage/IsaacLab/source/extensions/omni.isaac.lab_assets
+pip install -e /home/gaok/coding/sage/IsaacLab/source/extensions/omni.isaac.lab_tasks
+
+# M2T2 依赖
+pip install -e /home/gaok/coding/sage/M2T2/pointnet2_ops
+```
+
 ## 1. 准备与设置
 
 ### 1.0 背景布局数据准备
@@ -151,7 +179,7 @@ export SAGE_OBJECT_SOURCE=generation
 **无机器人房间生成：**
 ```bash
 cd /home/gaok/coding/sage/client
-conda activate sage
+conda activate sage       # RTX 5080 用户请用 conda activate sage5080
 python client_generation_room_desc.py \
   --room_desc "A bedroom." \
   --server_paths ../server/layout_wo_robot.py
@@ -160,7 +188,7 @@ python client_generation_room_desc.py \
 **机器人任务生成：**
 ```bash
 cd /home/gaok/coding/sage/client
-conda activate sage
+conda activate sage       # RTX 5080 用户请用 conda activate sage5080
 python client_generation_robot_task.py \
   --room_type "bedroom" \
   --robot_type "mobile franka" \
@@ -211,3 +239,120 @@ python client_generation_robot_task.py \
 ## 5. 策略训练
 
 有关策略训练的说明，请参考 `../robomimic` 文档，并使用生成的 HDF5 数据。
+
+---
+
+## 6. Isaac Sim 5.1 兼容性（2026-05-20 更新）
+
+SAGE 已适配 Isaac Sim 5.1。以下修改已应用到 `../IsaacLab/` 源码中，解决了旧 IsaacLab 在 5.x 下的若干不兼容问题。
+
+### 6.1 关键修复
+
+| 文件 | 修改 | 原因 |
+|------|------|------|
+| `omni.isaac.lab/app/app_launcher.py` | `from isaacsim import SimulationApp` | 5.x 中 `omni.isaac.kit` 已废弃，直接导入会导致 `ModuleNotFoundError: omni.kit.usd` |
+| `omni.isaac.lab/app/app_launcher.py` | 新增 `/isaaclab/cameras_enabled` carb setting | 不再依赖 `.kit` 文件中的 `[settings.isaaclab]` 来启用相机 |
+| `omni.isaac.lab/sim/converters/urdf_converter.py` | 新增 `_fix_physx5_compatibility()` | 5.x URDF importer 产生 instanceable prim + 退化质量/惯性，导致 PhysX 5.x 在 `timeline.commit()` 时卡死 |
+| `omni.isaac.lab/sim/converters/urdf_converter.py` | `set_import_option()` 兼容层 | 5.x URDF ImportConfig API 从 setter 方法变为属性 |
+| `omni.isaac.lab/sim/converters/urdf_converter.py` | `isaacsim.asset.importer.urdf` 回退 | 5.x 中扩展名从 `omni.importer.urdf` 改名 |
+| `omni.isaac.lab/sensors/camera/camera.py` | `__init__` 中预初始化 output dict | ObservationManager 在 simulation play 前查询 camera shape，5.x 下 `_is_outdated` 未就绪 |
+| `omni.isaac.lab/sensors/sensor_base.py` | `_update_outdated_buffers` 加 `hasattr` guard | 防止 sensor 未初始化时访问 `_is_outdated` |
+| `omni.isaac.lab/envs/ui/base_env_window.py` | `omni.isaac.ui` 缺失回退 | 5.x 移除了 `omni.isaac.ui` 模块，GUI 模式下 UI 窗口降级为空 |
+| `omni.isaac.lab/envs/manager_based_env.py` | UI 窗口创建 try-except | GUI 模式下 `omni.isaac.ui` 不可用时跳过控制面板 |
+| `source/apps/isaaclab.python.headless.kit` | 依赖更新为 5.x 命名 | `omni.isaac.kit` → `isaacsim.simulation_app` 等 |
+| `server/isaaclab/data_generation_*.py` | `num_envs` 作用域修复 | 全局变量与 CLI 参数冲突导致访问不存在的 `/World/envs/env_1` |
+
+### 6.2 RTX 5080 (Blackwell) 环境
+
+RTX 5080 需要 PyTorch ≥ 2.7（支持 sm_120）。`env_isaaclab` 环境已升级：
+
+```bash
+conda activate env_isaaclab
+python -c "import torch; print(torch.__version__, torch.cuda.get_device_name(0))"
+# 预期: 2.8.0+cu128  NVIDIA GeForce RTX 5080
+```
+
+安装 PyTorch 2.8.0 的方法（wheel 文件需手动下载）：
+
+```bash
+# 1. 下载 wheel 文件（约 2.5 GB），链接见下方
+# 2. 全部放到 ~/下载/ 后执行：
+pip install ~/下载/*.whl
+# 3. 重编译 CUDA 扩展
+pip install --no-build-isolation -e /home/gaok/coding/tigon/external/nvdiffrast
+pip install --no-build-isolation -e /home/gaok/coding/sage/M2T2/pointnet2_ops
+```
+
+所需 wheel 文件列表：
+| 包 | 大小 | 链接 |
+|----|------|------|
+| torch 2.8.0+cu128 | ~800 MB | `https://download.pytorch.org/whl/cu128/torch-2.8.0%2Bcu128-cp311-cp311-manylinux_2_28_x86_64.whl` |
+| torchvision 0.23.0+cu128 | ~9 MB | `https://download.pytorch.org/whl/cu128/torchvision-0.23.0%2Bcu128-cp311-cp311-manylinux_2_28_x86_64.whl` |
+| torchaudio 2.8.0+cu128 | ~4 MB | `https://download.pytorch.org/whl/cu128/torchaudio-2.8.0%2Bcu128-cp311-cp311-manylinux_2_28_x86_64.whl` |
+| triton 3.4.0 | ~155 MB | `https://download.pytorch.org/whl/triton-3.4.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl` |
+| NVIDIA 依赖 (×9) | ~1.4 GB | `https://pypi.nvidia.com/nvidia-{cublas/cudnn/cufft/curand/cusolver/cusparse/cusparselt/nccl/nvjitlink}-cu12/*.whl` |
+
+> **注意**：首次运行前需清除 URDF 转换缓存 `rm -rf /tmp/IsaacLab/usd_*`，以确保 PhysX 5.x 兼容修复生效。
+
+### 6.3 M2T2 模型
+
+M2T2 模型权重需从 HuggingFace 下载（约 131 MB）：
+
+```bash
+wget -O /home/gaok/coding/sage/M2T2/m2t2.pth \
+  "https://huggingface.co/wentao-yuan/m2t2/resolve/main/m2t2.pth"
+```
+
+### 6.4 运行数据生成
+
+```bash
+conda activate env_isaaclab
+cd /home/gaok/coding/sage
+
+# Headless 模式（服务器/无显示器）
+python server/isaaclab/data_generation_mobile_manipulation_from_layout_parsing.py \
+  --headless --enable_cameras \
+  --experience isaacsim.exp.base.python.kit \
+  --num_envs 1 --num_demos 1 --total_iterations_sim 200 \
+  --layout_id layout_da328faf
+
+# GUI 模式（可视化，需要显示器）
+python server/isaaclab/data_generation_mobile_manipulation_from_layout_parsing.py \
+  --enable_cameras \
+  --experience isaacsim.exp.base.kit \
+  --num_envs 1 --num_demos 1 --total_iterations_sim 200 \
+  --layout_id layout_da328faf
+```
+
+> `--experience isaacsim.exp.base.python.kit` 不可省略——IsaacLab 自带的 `.kit` 文件依赖 Isaac Sim 4.x 扩展名，在 5.x 下无法解析。
+
+### 6.5 支持的机器人
+
+| robot_type | 底座 | 自由度 | 任务类型 |
+|-----------|------|--------|---------|
+| `franka` | 固定 | 7 arm + 2 gripper | 桌面抓取/放置 |
+| `mobile_franka` | Omron 移动底盘 | 4 base + 7 arm + 2 gripper | 跨房间导航 + pick-and-place |
+
+VLM 根据用户描述自动判断 robot_type：含 "mobile" → `mobile_franka`，否则 → `franka`。
+
+### 6.6 已知问题
+
+- **GUI 模式**：`omni.isaac.ui` 模块在 Isaac Sim 5.x 中不存在，UI 控制面板自动降级为无窗口模式，但 3D viewport 正常显示
+- **显存**：`--enable_cameras` 会加载 10+ 个相机，每个 1080×1920，16 GB 显存刚好够用。如遇 OOM，需清理残留进程 `pkill -f data_generation`
+- **`timeline.commit()` 卡死**：如果重新导入 URDF 后仍卡死，确认 `/tmp/IsaacLab/usd_*` 已清除，URDF 转换缓存会复用旧版本
+
+
+✅ Instruction completed. Exiting...
+🔍 Layout ID: layout_1dbd70c2
+Task info saved to:  ./room_descs/20260513_183804_A_bedroom_.json
+💾 Enhanced chat log saved to: logs/chat_session_qwen3vl_20260513_183804.json
+📊 Token usage: 338860 input + 3714 output = 342574 total tokens
+🔧 Tool usage: 13/15 tool calls
+💬 Conversation summary:
+   👤 User messages: 1
+   🤖 Assistant messages: 14
+   🧠 Reasoning entries: 0
+   🔧 Tool calls: 13
+   📤 Tool results: 13
+Client chat log saved to: logs/chat_session_qwen3vl_20260513_183804.html
+💾 Chat log saved to: logs/chat_session_qwen3vl_20260513_183804.html

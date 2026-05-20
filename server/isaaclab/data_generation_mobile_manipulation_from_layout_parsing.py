@@ -676,6 +676,8 @@ def main():
     collected_data_episodes = 0
 
     # some motion planning parameters
+    num_envs = args_cli.num_envs
+
     T_grasp = args_cli.total_iterations_sim
     T_hold = 240
     T_init = 20

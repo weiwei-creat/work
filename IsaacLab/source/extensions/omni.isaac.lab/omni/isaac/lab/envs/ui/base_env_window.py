@@ -18,6 +18,12 @@ from pxr import PhysxSchema, Sdf, Usd, UsdGeom, UsdPhysics
 
 from omni.isaac.lab.ui.widgets import ManagerLiveVisualizer
 
+# Isaac Sim 5.x: omni.isaac.ui may not be available. Provide a no-op fallback.
+try:
+    import _isaac_ui_utils as _isaac_ui_utils
+except (ImportError, AttributeError):
+    _isaac_ui_utils = None
+
 if TYPE_CHECKING:
     import omni.ui
 
@@ -105,12 +111,16 @@ class BaseEnvWindow:
     def _build_sim_frame(self):
         """Builds the sim-related controls frame for the UI."""
         # create collapsable frame for controls
+        try:
+            style = _isaac_ui_utils.get_style()
+        except AttributeError:
+            style = {}
         self.ui_window_elements["sim_frame"] = omni.ui.CollapsableFrame(
             title="Simulation Settings",
             width=omni.ui.Fraction(1),
             height=0,
             collapsed=False,
-            style=omni.isaac.ui.ui_utils.get_style(),
+            style=style,
             horizontal_scrollbar_policy=omni.ui.ScrollBarPolicy.SCROLLBAR_AS_NEEDED,
             vertical_scrollbar_policy=omni.ui.ScrollBarPolicy.SCROLLBAR_ALWAYS_ON,
         )
@@ -127,7 +137,7 @@ class BaseEnvWindow:
                     "tooltip": "Select a rendering mode\n" + self.env.sim.RenderMode.__doc__,
                     "on_clicked_fn": lambda value: self.env.sim.set_render_mode(self.env.sim.RenderMode[value]),
                 }
-                self.ui_window_elements["render_dropdown"] = omni.isaac.ui.ui_utils.dropdown_builder(**render_mode_cfg)
+                self.ui_window_elements["render_dropdown"] = _isaac_ui_utils.dropdown_builder(**render_mode_cfg)
 
                 # create animation recording box
                 record_animate_cfg = {
@@ -138,7 +148,7 @@ class BaseEnvWindow:
                     "tooltip": "Record the animation of the scene. Only effective if fabric is disabled.",
                     "on_clicked_fn": lambda value: self._toggle_recording_animation_fn(value),
                 }
-                self.ui_window_elements["record_animation"] = omni.isaac.ui.ui_utils.state_btn_builder(
+                self.ui_window_elements["record_animation"] = _isaac_ui_utils.state_btn_builder(
                     **record_animate_cfg
                 )
                 # disable the button if fabric is not enabled
@@ -152,7 +162,7 @@ class BaseEnvWindow:
             width=omni.ui.Fraction(1),
             height=0,
             collapsed=False,
-            style=omni.isaac.ui.ui_utils.get_style(),
+            style=_isaac_ui_utils.get_style(),
             horizontal_scrollbar_policy=omni.ui.ScrollBarPolicy.SCROLLBAR_AS_NEEDED,
             vertical_scrollbar_policy=omni.ui.ScrollBarPolicy.SCROLLBAR_ALWAYS_ON,
         )
@@ -170,7 +180,7 @@ class BaseEnvWindow:
                     "max": self.env.num_envs,
                     "tooltip": "The environment index to follow. Only effective if follow mode is not 'World'.",
                 }
-                self.ui_window_elements["viewer_env_index"] = omni.isaac.ui.ui_utils.int_builder(**viewport_origin_cfg)
+                self.ui_window_elements["viewer_env_index"] = _isaac_ui_utils.int_builder(**viewport_origin_cfg)
                 # create a number slider to move to environment origin
                 self.ui_window_elements["viewer_env_index"].add_value_changed_fn(self._set_viewer_env_index_fn)
 
@@ -183,17 +193,17 @@ class BaseEnvWindow:
                     "tooltip": "Select the viewport camera following mode.",
                     "on_clicked_fn": self._set_viewer_origin_type_fn,
                 }
-                self.ui_window_elements["viewer_follow"] = omni.isaac.ui.ui_utils.dropdown_builder(**viewer_follow_cfg)
+                self.ui_window_elements["viewer_follow"] = _isaac_ui_utils.dropdown_builder(**viewer_follow_cfg)
 
                 # add viewer default eye and lookat locations
-                self.ui_window_elements["viewer_eye"] = omni.isaac.ui.ui_utils.xyz_builder(
+                self.ui_window_elements["viewer_eye"] = _isaac_ui_utils.xyz_builder(
                     label="Camera Eye",
                     tooltip="Modify the XYZ location of the viewer eye.",
                     default_val=self.env.cfg.viewer.eye,
                     step=0.1,
                     on_value_changed_fn=[self._set_viewer_location_fn] * 3,
                 )
-                self.ui_window_elements["viewer_lookat"] = omni.isaac.ui.ui_utils.xyz_builder(
+                self.ui_window_elements["viewer_lookat"] = _isaac_ui_utils.xyz_builder(
                     label="Camera Target",
                     tooltip="Modify the XYZ location of the viewer target.",
                     default_val=self.env.cfg.viewer.lookat,
@@ -215,7 +225,7 @@ class BaseEnvWindow:
             width=omni.ui.Fraction(1),
             height=0,
             collapsed=False,
-            style=omni.isaac.ui.ui_utils.get_style(),
+            style=_isaac_ui_utils.get_style(),
             horizontal_scrollbar_policy=omni.ui.ScrollBarPolicy.SCROLLBAR_AS_NEEDED,
             vertical_scrollbar_policy=omni.ui.ScrollBarPolicy.SCROLLBAR_ALWAYS_ON,
         )
@@ -404,7 +414,7 @@ class BaseEnvWindow:
             )
             omni.ui.Label(
                 name.replace("_", " ").title(),
-                width=omni.isaac.ui.ui_utils.LABEL_WIDTH - 12,
+                width=_isaac_ui_utils.LABEL_WIDTH - 12,
                 alignment=omni.ui.Alignment.LEFT_CENTER,
                 tooltip=text,
             )
@@ -420,7 +430,7 @@ class BaseEnvWindow:
                 checked=is_checked,
                 on_checked_fn=lambda value, e=weakref.proxy(elem): e.set_debug_vis(value),
             )
-            omni.isaac.ui.ui_utils.add_line_rect_flourish()
+            _isaac_ui_utils.add_line_rect_flourish()
 
         # Create a panel for the debug visualization
         if isinstance(elem, ManagerLiveVisualizer):

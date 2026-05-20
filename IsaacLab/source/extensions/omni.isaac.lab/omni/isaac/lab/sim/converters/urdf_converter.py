@@ -11,7 +11,7 @@ import omni.kit.commands
 import omni.usd
 from omni.isaac.core.utils.extensions import enable_extension
 from omni.isaac.version import get_version
-from pxr import Usd
+from pxr import Gf, Usd, UsdPhysics
 
 from .asset_converter_base import AssetConverterBase
 from .urdf_converter_cfg import UrdfConverterCfg
@@ -99,11 +99,69 @@ class UrdfConverter(AssetConverterBase):
         # resolve all paths relative to layer path
         source_layer = stage.GetRootLayer()
         omni.usd.resolve_paths(source_layer.identifier, source_layer.identifier)
+        # Isaac Sim 5.x compatibility: post-process the generated USD to prevent
+        # PhysX 5.x from hanging during articulation construction.
+        self._fix_physx5_compatibility(stage)
         stage.Save()
 
     """
     Helper methods.
     """
+
+    def _fix_physx5_compatibility(self, stage: Usd.Stage):
+        """Post-process the generated USD to ensure PhysX 5.x compatibility.
+
+        Isaac Sim 5.x ships with PhysX 5.x which has stricter requirements for
+        reduced-coordinate articulations. Without these fixes the physics timeline
+        may hang during ``commit()`` / articulation construction.
+
+        The following issues are addressed:
+
+        1. **Instanceable prims**: Isaac Sim 5.x's URDF importer authors instanceable
+           flags on link visuals/collisions even when ``make_instanceable`` is false.
+           PhysX 5.x cannot resolve instanceable physics prims during articulation
+           building, causing a hang.
+        2. **Degenerate mass/inertia**: Links with near-zero mass or zero diagonal
+           inertia cause singular mass matrices in PhysX 5.x, which can trigger an
+           infinite loop in the articulation builder.
+
+        Args:
+            stage: The USD stage to fix (modified in-place).
+        """
+        min_mass = 0.1
+        min_inertia = 1e-4
+
+        for prim in stage.TraverseAll():
+            # -- 1. Clear instanceable flags on all prims when not intentionally instanceable --
+            #    Isaac Sim 5.x's URDF importer writes instanceable=true even when
+            #    make_instanceable is false. PhysX 5.x cannot build articulations
+            #    that contain instanceable physics prims.
+            if not self.cfg.make_instanceable and prim.IsInstanceable():
+                prim.SetInstanceable(False)
+
+            # -- 2. Fix degenerate mass properties on rigid bodies --
+            if prim.HasAPI(UsdPhysics.RigidBodyAPI):
+                # Isaac Sim 5.x: RigidBodyAPI may not expose GetMassAttr();
+                # access the "physics:mass" attribute directly for portability.
+                mass_attr = prim.GetAttribute("physics:mass")
+                if mass_attr.IsValid():
+                    mass = mass_attr.Get()
+                    if mass is None or mass < min_mass:
+                        mass_attr.Set(min_mass)
+
+                # diagonalInertia is authored via the RigidBodyAPI or PhysxRigidBodyAPI
+                inertia_attr = prim.GetAttribute("physics:diagonalInertia")
+                if inertia_attr.IsValid() and inertia_attr.IsAuthored():
+                    inertia = inertia_attr.Get()
+                    if inertia is not None:
+                        new_inertia = list(inertia)
+                        fixed = False
+                        for i in range(3):
+                            if new_inertia[i] < min_inertia:
+                                new_inertia[i] = min_inertia
+                                fixed = True
+                        if fixed:
+                            inertia_attr.Set(Gf.Vec3f(*new_inertia))
 
     def _get_urdf_import_config(self, cfg: UrdfConverterCfg) -> omni.importer.urdf.ImportConfig:
         """Create and fill URDF ImportConfig with desired settings
@@ -114,50 +172,61 @@ class UrdfConverter(AssetConverterBase):
         Returns:
             The constructed ``ImportConfig`` object containing the desired settings.
         """
-        # Enable urdf extension
-        enable_extension("omni.importer.urdf")
-
-        from omni.importer.urdf import _urdf as omni_urdf
+        # Enable urdf extension. Isaac Sim 5.x renamed the package from
+        # ``omni.importer.urdf`` to ``isaacsim.asset.importer.urdf``.
+        try:
+            enable_extension("omni.importer.urdf")
+            from omni.importer.urdf import _urdf as omni_urdf
+        except ModuleNotFoundError:
+            enable_extension("isaacsim.asset.importer.urdf")
+            from isaacsim.asset.importer.urdf import _urdf as omni_urdf
 
         import_config = omni_urdf.ImportConfig()
 
+        def set_import_option(name: str, value):
+            setter_name = f"set_{name}"
+            if hasattr(import_config, setter_name):
+                getattr(import_config, setter_name)(value)
+            elif hasattr(import_config, name):
+                setattr(import_config, name, value)
+
         # set the unit scaling factor, 1.0 means meters, 100.0 means cm
-        import_config.set_distance_scale(1.0)
+        set_import_option("distance_scale", 1.0)
         # set imported robot as default prim
-        import_config.set_make_default_prim(True)
+        set_import_option("make_default_prim", True)
         # add a physics scene to the stage on import if none exists
-        import_config.set_create_physics_scene(False)
+        set_import_option("create_physics_scene", False)
 
         # -- instancing settings
         # meshes will be placed in a separate usd file
-        import_config.set_make_instanceable(cfg.make_instanceable)
-        import_config.set_instanceable_usd_path(self.usd_instanceable_meshes_path)
+        set_import_option("make_instanceable", cfg.make_instanceable)
+        set_import_option("instanceable_usd_path", self.usd_instanceable_meshes_path)
 
         # -- asset settings
         # default density used for links, use 0 to auto-compute
-        import_config.set_density(cfg.link_density)
+        set_import_option("density", cfg.link_density)
         # import inertia tensor from urdf, if it is not specified in urdf it will import as identity
-        import_config.set_import_inertia_tensor(cfg.import_inertia_tensor)
+        set_import_option("import_inertia_tensor", cfg.import_inertia_tensor)
         # decompose a convex mesh into smaller pieces for a closer fit
-        import_config.set_convex_decomp(cfg.convex_decompose_mesh)
-        import_config.set_subdivision_scheme(_NORMALS_DIVISION["bilinear"])
+        set_import_option("convex_decomp", cfg.convex_decompose_mesh)
+        set_import_option("subdivision_scheme", _NORMALS_DIVISION["bilinear"])
 
         # -- physics settings
         # create fix joint for base link
-        import_config.set_fix_base(cfg.fix_base)
+        set_import_option("fix_base", cfg.fix_base)
         # consolidating links that are connected by fixed joints
-        import_config.set_merge_fixed_joints(cfg.merge_fixed_joints)
+        set_import_option("merge_fixed_joints", cfg.merge_fixed_joints)
         # self collisions between links in the articulation
-        import_config.set_self_collision(cfg.self_collision)
+        set_import_option("self_collision", cfg.self_collision)
 
         # default drive type used for joints
-        import_config.set_default_drive_type(_DRIVE_TYPE[cfg.default_drive_type])
+        set_import_option("default_drive_type", _DRIVE_TYPE[cfg.default_drive_type])
         # default proportional gains
-        import_config.set_default_drive_strength(cfg.default_drive_stiffness)
+        set_import_option("default_drive_strength", cfg.default_drive_stiffness)
         # default derivative gains
-        import_config.set_default_position_drive_damping(cfg.default_drive_damping)
+        set_import_option("default_position_drive_damping", cfg.default_drive_damping)
         if get_version()[2] == "4":
             # override joint dynamics parsed from urdf
-            import_config.set_override_joint_dynamics(cfg.override_joint_dynamics)
+            set_import_option("override_joint_dynamics", cfg.override_joint_dynamics)
 
         return import_config

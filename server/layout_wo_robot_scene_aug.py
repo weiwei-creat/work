@@ -102,6 +102,7 @@ from floor_plan_materials.flux_generator import (
 from floor_plan_materials.material_generator import (
     material_generate_from_prompt
 )
+from material_fallbacks import ensure_visible_room_texture, make_procedural_room_texture
 from isaaclab.correct_mobile_franka import (
     correct_mobile_franka_standalone,
     robot_task_feasibility_correction_for_room_standalone
@@ -643,6 +644,7 @@ async def select_materials_for_rooms(floor_plan: FloorPlan) -> FloorPlan:
 
                 if True:
                     floor_texture_map_pil = material_generate_from_prompt([floor_description])[0]
+                    floor_texture_map_pil = ensure_visible_room_texture(floor_texture_map_pil, "floor")
                     floor_texture_map_pil = repeat_texture(floor_texture_map_pil, 2)
                     room.floor_material = room_id + "_floor"
 
@@ -650,6 +652,7 @@ async def select_materials_for_rooms(floor_plan: FloorPlan) -> FloorPlan:
                     floor_texture_map_pil.save(floor_material_save_path)
 
                     wall_texture_map_pil = material_generate_from_prompt([wall_description])[0]
+                    wall_texture_map_pil = ensure_visible_room_texture(wall_texture_map_pil, "wall")
                     wall_texture_map_pil = repeat_texture(wall_texture_map_pil, 2)
                     wall_material = room_id + "_wall"
 
@@ -658,14 +661,16 @@ async def select_materials_for_rooms(floor_plan: FloorPlan) -> FloorPlan:
 
                 else:
 
-                    floor_texture_map_pil = generate_image_from_prompt("A uniform, flat UV texture image of "+floor_description)
+                    floor_texture_map_pil = generate_image_from_prompt("A seamless UV texture image with visible material pattern and scale cues: "+floor_description)
+                    floor_texture_map_pil = ensure_visible_room_texture(floor_texture_map_pil, "floor")
                     floor_texture_map_pil = repeat_texture(floor_texture_map_pil, 2)
                     room.floor_material = room_id + "_floor"
 
                     floor_material_save_path = os.path.join(material_save_dir, f"{room.floor_material}.png")
                     floor_texture_map_pil.save(floor_material_save_path)
 
-                    wall_texture_map_pil = generate_image_from_prompt("A uniform, flat UV texture image of "+wall_description)
+                    wall_texture_map_pil = generate_image_from_prompt("A seamless UV texture image with visible surface detail and subtle pattern: "+wall_description)
+                    wall_texture_map_pil = ensure_visible_room_texture(wall_texture_map_pil, "wall")
                     wall_texture_map_pil = repeat_texture(wall_texture_map_pil, 2)
                     wall_material = room_id + "_wall"
 
@@ -681,11 +686,15 @@ async def select_materials_for_rooms(floor_plan: FloorPlan) -> FloorPlan:
         
     except Exception as e:
         print(f"Warning: Material selection failed: {e}. Using default materials.", file=sys.stderr)
-        # Use default materials if material selection fails
+        material_save_dir = os.path.join(RESULTS_DIR, floor_plan.id, "materials")
+        os.makedirs(material_save_dir, exist_ok=True)
         for room in floor_plan.rooms:
-            room.floor_material = "hardwood"
+            room.floor_material = room.id + "_floor"
+            make_procedural_room_texture("floor").save(os.path.join(material_save_dir, f"{room.floor_material}.png"))
+            wall_material = room.id + "_wall"
+            make_procedural_room_texture("wall").save(os.path.join(material_save_dir, f"{wall_material}.png"))
             for wall in room.walls:
-                wall.material = "drywall"
+                wall.material = wall_material
         return floor_plan
 
 

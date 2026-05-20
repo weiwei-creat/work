@@ -1,4 +1,3 @@
-from torchvision import transforms
 from typing import List
 import numpy as np
 import pickle

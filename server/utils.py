@@ -17,7 +17,10 @@ from models import Point3D, Dimensions, Wall
 from typing import Dict, Any, Optional
 from key import ANTHROPIC_API_KEY
 from vlm import call_vlm
-import anthropic
+try:
+    import anthropic
+except ImportError:
+    anthropic = None
 import json
 from validation import check_room_overlap
 from models import FloorPlan, Room, Door, Window, Wall, Object, Euler

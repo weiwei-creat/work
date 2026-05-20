@@ -102,6 +102,7 @@ from floor_plan_materials.flux_generator import (
 from floor_plan_materials.material_generator import (
     material_generate_from_prompt
 )
+from material_fallbacks import ensure_visible_room_texture, make_procedural_room_texture
 from isaaclab.correct_mobile_franka import (
     correct_mobile_franka_standalone,
     robot_task_feasibility_correction_for_room_standalone
@@ -644,6 +645,7 @@ async def select_materials_for_rooms(floor_plan: FloorPlan) -> FloorPlan:
 
                 if True:
                     floor_texture_map_pil = material_generate_from_prompt([floor_description])[0]
+                    floor_texture_map_pil = ensure_visible_room_texture(floor_texture_map_pil, "floor")
                     floor_texture_map_pil = repeat_texture(floor_texture_map_pil, 2)
                     room.floor_material = room_id + "_floor"
 
@@ -651,6 +653,7 @@ async def select_materials_for_rooms(floor_plan: FloorPlan) -> FloorPlan:
                     floor_texture_map_pil.save(floor_material_save_path)
 
                     wall_texture_map_pil = material_generate_from_prompt([wall_description])[0]
+                    wall_texture_map_pil = ensure_visible_room_texture(wall_texture_map_pil, "wall")
                     wall_texture_map_pil = repeat_texture(wall_texture_map_pil, 2)
                     wall_material = room_id + "_wall"
 
@@ -659,14 +662,16 @@ async def select_materials_for_rooms(floor_plan: FloorPlan) -> FloorPlan:
 
                 else:
 
-                    floor_texture_map_pil = generate_image_from_prompt("A uniform, flat UV texture image of "+floor_description)
+                    floor_texture_map_pil = generate_image_from_prompt("A seamless UV texture image with visible material pattern and scale cues: "+floor_description)
+                    floor_texture_map_pil = ensure_visible_room_texture(floor_texture_map_pil, "floor")
                     floor_texture_map_pil = repeat_texture(floor_texture_map_pil, 2)
                     room.floor_material = room_id + "_floor"
 
                     floor_material_save_path = os.path.join(material_save_dir, f"{room.floor_material}.png")
                     floor_texture_map_pil.save(floor_material_save_path)
 
-                    wall_texture_map_pil = generate_image_from_prompt("A uniform, flat UV texture image of "+wall_description)
+                    wall_texture_map_pil = generate_image_from_prompt("A seamless UV texture image with visible surface detail and subtle pattern: "+wall_description)
+                    wall_texture_map_pil = ensure_visible_room_texture(wall_texture_map_pil, "wall")
                     wall_texture_map_pil = repeat_texture(wall_texture_map_pil, 2)
                     wall_material = room_id + "_wall"
 
@@ -682,11 +687,15 @@ async def select_materials_for_rooms(floor_plan: FloorPlan) -> FloorPlan:
         
     except Exception as e:
         print(f"Warning: Material selection failed: {e}. Using default materials.", file=sys.stderr)
-        # Use default materials if material selection fails
+        material_save_dir = os.path.join(RESULTS_DIR, floor_plan.id, "materials")
+        os.makedirs(material_save_dir, exist_ok=True)
         for room in floor_plan.rooms:
-            room.floor_material = "hardwood"
+            room.floor_material = room.id + "_floor"
+            make_procedural_room_texture("floor").save(os.path.join(material_save_dir, f"{room.floor_material}.png"))
+            wall_material = room.id + "_wall"
+            make_procedural_room_texture("wall").save(os.path.join(material_save_dir, f"{wall_material}.png"))
             for wall in room.walls:
-                wall.material = "drywall"
+                wall.material = wall_material
         return floor_plan
 
 
@@ -3863,77 +3872,83 @@ Be strict - only match objects that are semantically appropriate for the robot t
         import io
         import tempfile
         from PIL import Image as PILImage
-        
-        # Step 1: Render the room from four top views
-        try:
-            all_rgb = render_room_four_edges_view(current_layout, room_id, resolution=1920)
-        except Exception as e:
-            return json.dumps({
-                "success": False,
-                "error": f"Failed to render room views: {str(e)}",
-                "room_id": room_id
-            })
-        
+
         # Create vis directory for debugging
         vis_dir = f"{SERVER_ROOT_DIR}/vis"
         os.makedirs(vis_dir, exist_ok=True)
+
+        render_errors = []
+        all_rgb = None
+        top_down_rgb = None
+        top_down_image_base64 = None
+        saved_image_paths = []
+        image_data_list = []
+
+        # Step 1: Render the room from four perspective views (requires Isaac Sim)
+        try:
+            all_rgb = render_room_four_edges_view(current_layout, room_id, resolution=1920)
+            print(f"Rendered {len(all_rgb)} perspective views for room {room_id}", file=sys.stderr)
+        except Exception as e:
+            render_errors.append(f"Failed to render perspective views: {str(e)}")
+            print(f"Warning: {render_errors[-1]}", file=sys.stderr)
 
         # Step 1.5: Generate annotated top-down orthogonal view
         try:
             top_down_rgb = render_room_top_orthogonal_view(current_layout, room_id, resolution=1024)
             top_down_rgb = np.clip(top_down_rgb * 255, 0, 255).astype(np.uint8)
-            
-            # Annotate with object bounding boxes and arrows (copy annotation logic from eval_appearance.py)
+
+            # Annotate with object bounding boxes and arrows
             top_down_rgb = annotate_top_down_view_with_objects(top_down_rgb, room)
-            
+
             # Save for debugging
             top_down_debug_path = os.path.join(vis_dir, f"{room_id}_top_down_annotated.png")
             PILImage.fromarray(top_down_rgb).save(top_down_debug_path)
-            
+            saved_image_paths.append(top_down_debug_path)
+
             # Convert to base64
             buffer = io.BytesIO()
             PILImage.fromarray(top_down_rgb).save(buffer, format='PNG')
             top_down_image_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
-            
-            print(f"✅ Annotated top-down view created: {top_down_debug_path}", file=sys.stderr)
-            
+
+            print(f"Annotated top-down view created: {top_down_debug_path}", file=sys.stderr)
+
         except Exception as e:
+            render_errors.append(f"Failed to create annotated top-down view: {str(e)}")
+            print(f"Warning: {render_errors[-1]}", file=sys.stderr)
+
+        # Convert perspective RGB arrays to base64 and save for debugging
+        if all_rgb is not None:
+            for i, rgb_array in enumerate(all_rgb):
+                try:
+                    rgb_uint8 = (rgb_array * 255).astype(np.uint8)
+                    pil_image = PILImage.fromarray(rgb_uint8, 'RGB')
+
+                    debug_path = os.path.join(vis_dir, f"{room_id}_rendered_view_{i+1}.png")
+                    pil_image.save(debug_path)
+                    saved_image_paths.append(debug_path)
+
+                    buffer = io.BytesIO()
+                    pil_image.save(buffer, format='PNG')
+                    image_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+                    image_data_list.append(image_base64)
+
+                except Exception as e:
+                    render_errors.append(f"Failed to process rendered view {i}: {str(e)}")
+                    print(f"Warning: {render_errors[-1]}", file=sys.stderr)
+
+        # If we have NO images at all, we can't do visual analysis
+        if not top_down_image_base64 and not image_data_list:
             return json.dumps({
                 "success": False,
-                "error": f"Failed to create annotated top-down view: {str(e)}",
+                "error": f"Failed to generate any room renders for semantic analysis. Errors: {'; '.join(render_errors)}",
                 "room_id": room_id
             })
-        
-        # Convert RGB arrays to base64 encoded images for Claude and save for debugging
-        image_data_list = []
-        saved_image_paths = [top_down_debug_path]
-        
-        for i, rgb_array in enumerate(all_rgb):
-            try:
-                # Convert RGB array to PIL Image (assuming rgb_array is in [0,1] range)
-                rgb_uint8 = (rgb_array * 255).astype(np.uint8)
-                pil_image = PILImage.fromarray(rgb_uint8, 'RGB')
-                
-                # Save rendered view for debugging
-                debug_path = os.path.join(vis_dir, f"{room_id}_rendered_view_{i+1}.png")
-                pil_image.save(debug_path)
-                saved_image_paths.append(debug_path)
-                
-                # Convert to base64
-                buffer = io.BytesIO()
-                pil_image.save(buffer, format='PNG')
-                image_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
-                image_data_list.append(image_base64)
-                
-            except Exception as e:
-                return json.dumps({
-                    "success": False,
-                    "error": f"Failed to process rendered view {i}: {str(e)}",
-                    "room_id": room_id
-                })
-        
-        # Step 2: Prepare room information for Claude
-        room_description = get_room_description(room)
+
+        # If we only have the top-down view but no perspective renders, use just the top-down
+        if top_down_image_base64 and not image_data_list:
+            print(f"Only top-down view available for semantic analysis of room {room_id}", file=sys.stderr)
+        elif not top_down_image_base64 and image_data_list:
+            print(f"Only perspective views available for semantic analysis of room {room_id}", file=sys.stderr)
 
         # Step 3: Create prompt for Claude analysis
         final_floor_objects = [obj for obj in room.objects if obj.place_id == 'floor']
@@ -3964,13 +3979,22 @@ CURRENT ACTION CONTEXT:
 This describes the current object placement action being performed. Consider this context when evaluating the room layout.
 """
         
+        # Build the image description based on what's available
+        image_description_parts = []
+        image_idx = 0
+        if top_down_image_base64 is not None:
+            image_idx += 1
+            image_description_parts.append(f"{image_idx}. Annotated top-down orthogonal view with object bounding boxes (blue), facing directions (yellow arrows), and coordinate axes")
+        if image_data_list:
+            num_perspective = len(image_data_list)
+            start_idx = image_idx + 1
+            image_description_parts.append(f"{start_idx}-{start_idx + num_perspective - 1}. {num_perspective} perspective rendered views from different angles — use these for visual realism, aesthetics, and overall room atmosphere assessment")
+
+        images_section = "IMAGES PROVIDED:\n" + "\n".join(image_description_parts) if image_description_parts else "IMAGES PROVIDED: No rendered images available. Use the room information below for text-based analysis only."
+
         prompt = f"""You are an expert interior designer. Analyze this room design for semantic correctness and provide actionable improvement suggestions.
 
-IMAGES PROVIDED:
-1. First image: Annotated top-down orthogonal view with object bounding boxes (blue), facing directions (yellow arrows), and coordinate axes
-
-2. Next 4 images: Four perspective rendered views from different angles
-   - Use these for visual realism, aesthetics, and overall room atmosphere assessment
+{images_section}
 
 {user_demand_section}
 
@@ -4113,34 +4137,35 @@ At most 1-2 object adjustment analysis recommendations.
 
 """
 
-        # Step 4: Call Claude API with images
-        
+        # Step 4: Call VLM API with images
+
         # Prepare messages with images
         content = [{"type": "text", "text": prompt}]
-        
+
         # Add the annotated top-down view first (most important for layout analysis)
-        content.append({
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": "image/png",
-                "data": top_down_image_base64
-            }
-        })
-        
-        # Add the four rendered images
-        for i, image_base64 in enumerate(image_data_list):
+        if top_down_image_base64 is not None:
             content.append({
-                "type": "image", 
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": top_down_image_base64
+                }
+            })
+
+        # Add the rendered perspective images
+        for image_base64 in image_data_list:
+            content.append({
+                "type": "image",
                 "source": {
                     "type": "base64",
                     "media_type": "image/png",
                     "data": image_base64
                 }
             })
-        
-        
-        total_images = 1 + len(image_data_list)  # 1 annotated top-down + 4 rendered views
+
+
+        total_images = (1 if top_down_image_base64 is not None else 0) + len(image_data_list)
         
         response = call_vlm(
             vlm_type="qwen",

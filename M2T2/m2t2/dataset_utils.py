@@ -10,12 +10,48 @@
 '''
 Utility functions for data preprocessing.
 '''
-from torchvision import transforms
 import numpy as np
 import torch
 
 
-class NormalizeInverse(transforms.Normalize):
+class Compose:
+    def __init__(self, transforms):
+        self.transforms = transforms
+
+    def __call__(self, value):
+        for transform in self.transforms:
+            value = transform(value)
+        return value
+
+
+class ToTensor:
+    def __call__(self, value):
+        if isinstance(value, torch.Tensor):
+            tensor = value.float()
+        else:
+            array = np.array(value)
+            if array.ndim == 2:
+                array = array[:, :, None]
+            tensor = torch.from_numpy(array).float()
+        if tensor.ndim == 3 and tensor.shape[-1] in (1, 3, 4):
+            tensor = tensor.permute(2, 0, 1)
+        if tensor.numel() > 0 and tensor.max() > 1:
+            tensor = tensor / 255.0
+        return tensor
+
+
+class Normalize:
+    def __init__(self, mean, std):
+        self.mean = torch.as_tensor(mean).view(-1, 1, 1)
+        self.std = torch.as_tensor(std).view(-1, 1, 1)
+
+    def __call__(self, tensor):
+        mean = self.mean.to(device=tensor.device, dtype=tensor.dtype)
+        std = self.std.to(device=tensor.device, dtype=tensor.dtype)
+        return (tensor - mean) / std
+
+
+class NormalizeInverse(Normalize):
     def __init__(self, mean, std):
         mean = torch.as_tensor(mean)
         std = torch.as_tensor(std)
@@ -27,16 +63,16 @@ class NormalizeInverse(transforms.Normalize):
         return super().__call__(tensor.clone())
 
 
-normalize_rgb = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize(
+normalize_rgb = Compose([
+    ToTensor(),
+    Normalize(
         mean=[0.485, 0.456, 0.406],
         std=[0.229, 0.224, 0.225]
     )
 ])
 
 
-denormalize_rgb = transforms.Compose([
+denormalize_rgb = Compose([
     NormalizeInverse(
         mean=[0.485, 0.456, 0.406],
         std=[0.229, 0.224, 0.225]

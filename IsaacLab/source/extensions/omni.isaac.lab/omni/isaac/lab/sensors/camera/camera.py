@@ -139,6 +139,31 @@ class Camera(SensorBase):
         self._sensor_prims: list[UsdGeom.Camera] = list()
         # Create empty variables for storing output data
         self._data = CameraData()
+        # Pre-initialise output dict with placeholder tensors so that
+        # observation terms can query shapes before the simulation plays.
+        image_shape = (self.cfg.height, self.cfg.width)
+        self._data.output = {}
+        for data_type in self.cfg.data_types:
+            if data_type == "rgb":
+                self._data.output[data_type] = torch.zeros(
+                    (*image_shape, 4), device="cpu"
+                )
+            elif data_type == "distance_to_image_plane":
+                self._data.output[data_type] = torch.zeros(
+                    (*image_shape, 1), device="cpu"
+                )
+            elif data_type in (
+                "instance_segmentation",
+                "instance_segmentation_fast",
+                "semantic_segmentation",
+            ):
+                self._data.output[data_type] = torch.zeros(
+                    image_shape, dtype=torch.int32, device="cpu"
+                )
+            else:
+                self._data.output[data_type] = torch.zeros(
+                    (*image_shape, 1), device="cpu"
+                )
 
     def __del__(self):
         """Unsubscribes from callbacks and detach from the replicator registry."""

@@ -149,12 +149,19 @@ class ManagerBasedEnv:
         # we need to do this here after all the managers are initialized
         # this is because they dictate the sensors and commands right now
         if self.sim.has_gui() and self.cfg.ui_window_class_type is not None:
-            # setup live visualizers
-            self.setup_manager_visualizers()
-            self._window = self.cfg.ui_window_class_type(self, window_name="IsaacLab")
+            try:
+                __import__("omni.isaac.ui")
+                # setup live visualizers
+                self.setup_manager_visualizers()
+                self._window = self.cfg.ui_window_class_type(self, window_name="IsaacLab")
+            except (ModuleNotFoundError, AttributeError):
+                print("[WARN] omni.isaac.ui not available (Isaac Sim 5.x). Running without UI window.")
+                self._window = None
         else:
             # if no window, then we don't need to store the window
             self._window = None
+
+        # allocate dictionary to store metrics
 
         # allocate dictionary to store metrics
         self.extras = {}

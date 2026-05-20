@@ -253,18 +253,19 @@ def process_single_object(object_name: str, object_info: dict, room: Room, objec
     
     return selected_objects, updated_recommendations
 
-def select_objects(object_info_dict: dict, room: Room, existing_objects: List[Object], current_layout: FloorPlan, selection_source = "objaverse"):
+def select_objects(object_info_dict: dict, room: Room, existing_objects: List[Object], current_layout: FloorPlan, selection_source = "objaverse", max_new_objects: int = 0):
 
     object_save_dir = f"{RESULTS_DIR}/{current_layout.id}"
     os.makedirs(object_save_dir, exist_ok=True)
 
     selected_objects = []
     updated_recommendations = []
-    
+
     max_workers = int(os.environ.get("SAGE_OBJECT_WORKERS", "1"))
     max_workers = max(1, max_workers)
     print(f"Object selection workers: {max_workers}", file=sys.stderr)
-    max_new_objects_per_room = _env_int("SAGE_MAX_NEW_OBJECTS_PER_ROOM", 0)
+    # Use explicit max_new_objects parameter first, then fall back to env var
+    max_new_objects_per_room = max_new_objects if max_new_objects > 0 else _env_int("SAGE_MAX_NEW_OBJECTS_PER_ROOM", 0)
     room_budget_remaining = max_new_objects_per_room if max_new_objects_per_room > 0 else None
     configured_object_info_dict = {}
     for object_name, object_info in object_info_dict.items():

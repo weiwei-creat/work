@@ -19,8 +19,12 @@ import random
 import threading
 from datetime import datetime
 from key import ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, API_TOKEN, API_URL_DICT, MODEL_DICT
-import anthropic
 from constants import SERVER_ROOT_DIR
+try:
+    import anthropic
+except ImportError:
+    print("Warning: Anthropic library not installed or unavailable. Install with: pip install anthropic")
+    anthropic = None
 try:
     from openai import OpenAI
 except ImportError:
@@ -507,6 +511,8 @@ def _call_claude_with_retry(
     max_retries, retry_base_delay, retry_max_delay
 ):
     """Call Claude API with retry logic."""
+    if anthropic is None:
+        raise ImportError("Anthropic library is not installed or unavailable. Cannot use Claude.")
     client_kwargs = {"api_key": ANTHROPIC_API_KEY}
     if ANTHROPIC_BASE_URL:
         client_kwargs["base_url"] = ANTHROPIC_BASE_URL

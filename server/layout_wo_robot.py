@@ -102,6 +102,7 @@ from floor_plan_materials.flux_generator import (
 from floor_plan_materials.material_generator import (
     material_generate_from_prompt
 )
+from material_fallbacks import ensure_visible_room_texture, make_procedural_room_texture
 from isaaclab.correct_mobile_franka import (
     correct_mobile_franka_standalone,
     robot_task_feasibility_correction_for_room_standalone
@@ -113,6 +114,14 @@ current_layout: Optional[FloorPlan] = None
 room_num_calls: Dict = {}
 policy_analysis: Dict = {}
 occupancy_ratio: float = 45
+
+# Track per-room object placement failures for auto-degradation
+# Format: {room_id: {object_type: failure_count}}
+_object_failure_tracker: Dict[str, Dict[str, int]] = {}
+
+# Track critic scores across iterations for convergence detection
+# Format: {room_id: [max_score_1, max_score_2, ...]}
+_critic_score_history: Dict[str, List[int]] = {}
 
 # Initialize FastMCP server
 mcp = FastMCP(f"layout_{os.environ.get('SLURM_JOB_ID')}")
@@ -643,6 +652,7 @@ async def select_materials_for_rooms(floor_plan: FloorPlan) -> FloorPlan:
 
                 if True:
                     floor_texture_map_pil = material_generate_from_prompt([floor_description])[0]
+                    floor_texture_map_pil = ensure_visible_room_texture(floor_texture_map_pil, "floor")
                     floor_texture_map_pil = repeat_texture(floor_texture_map_pil, 2)
                     room.floor_material = room_id + "_floor"
 
@@ -650,6 +660,7 @@ async def select_materials_for_rooms(floor_plan: FloorPlan) -> FloorPlan:
                     floor_texture_map_pil.save(floor_material_save_path)
 
                     wall_texture_map_pil = material_generate_from_prompt([wall_description])[0]
+                    wall_texture_map_pil = ensure_visible_room_texture(wall_texture_map_pil, "wall")
                     wall_texture_map_pil = repeat_texture(wall_texture_map_pil, 2)
                     wall_material = room_id + "_wall"
 
@@ -658,14 +669,16 @@ async def select_materials_for_rooms(floor_plan: FloorPlan) -> FloorPlan:
 
                 else:
 
-                    floor_texture_map_pil = generate_image_from_prompt("A uniform, flat UV texture image of "+floor_description)
+                    floor_texture_map_pil = generate_image_from_prompt("A seamless UV texture image with visible material pattern and scale cues: "+floor_description)
+                    floor_texture_map_pil = ensure_visible_room_texture(floor_texture_map_pil, "floor")
                     floor_texture_map_pil = repeat_texture(floor_texture_map_pil, 2)
                     room.floor_material = room_id + "_floor"
 
                     floor_material_save_path = os.path.join(material_save_dir, f"{room.floor_material}.png")
                     floor_texture_map_pil.save(floor_material_save_path)
 
-                    wall_texture_map_pil = generate_image_from_prompt("A uniform, flat UV texture image of "+wall_description)
+                    wall_texture_map_pil = generate_image_from_prompt("A seamless UV texture image with visible surface detail and subtle pattern: "+wall_description)
+                    wall_texture_map_pil = ensure_visible_room_texture(wall_texture_map_pil, "wall")
                     wall_texture_map_pil = repeat_texture(wall_texture_map_pil, 2)
                     wall_material = room_id + "_wall"
 
@@ -681,11 +694,15 @@ async def select_materials_for_rooms(floor_plan: FloorPlan) -> FloorPlan:
         
     except Exception as e:
         print(f"Warning: Material selection failed: {e}. Using default materials.", file=sys.stderr)
-        # Use default materials if material selection fails
+        material_save_dir = os.path.join(RESULTS_DIR, floor_plan.id, "materials")
+        os.makedirs(material_save_dir, exist_ok=True)
         for room in floor_plan.rooms:
-            room.floor_material = "hardwood"
+            room.floor_material = room.id + "_floor"
+            make_procedural_room_texture("floor").save(os.path.join(material_save_dir, f"{room.floor_material}.png"))
+            wall_material = room.id + "_wall"
+            make_procedural_room_texture("wall").save(os.path.join(material_save_dir, f"{wall_material}.png"))
             for wall in room.walls:
-                wall.material = "drywall"
+                wall.material = wall_material
         return floor_plan
 
 
@@ -1907,28 +1924,38 @@ PLACEMENT CONDITIONS:
 TASK:
 Analyze the placement conditions to determine what type of operation is requested:
 
-1. "add" - Adding new objects while keeping existing ones (keywords: "add", "place additional", "also add", "include", "plus")
-2. "remove" - Removing specific objects (keywords: "remove", "delete", "take away", "get rid of")
+1. "replace" - Replace all existing objects with a completely new set (keywords: "replace", "design", "furnish", "create", "redo", "setup", "new layout", "from scratch", "change everything"). This is the DEFAULT when the room has 0 existing objects.
+2. "add" - Adding new objects while keeping existing ones (keywords: "add", "place additional", "also add", "include", "plus", "more")
+3. "remove" - Removing specific objects (keywords: "remove", "delete", "take away", "get rid of")
 
 If it's a "remove" operation, identify which specific objects should be removed based on the conditions.
+[CRITICAL] If the conditions contain "Replace all objects" or the room has 0 objects, operation_type MUST be "replace".
 
 OUTPUT FORMAT:
 Please respond with a JSON object in this exact format:
 
 ```json
 {{
-    "operation_type": "add|remove",
+    "operation_type": "replace|add|remove",
     "analysis": "Brief explanation of your analysis",
     "objects_to_remove": ["object_id_1", "object_id_2"] // Only if operation_type is "remove"
 }}
 ```
 
 Examples:
-- "add a desk and chair" → 
+- "Replace all objects with a modern bedroom setup" →
+```json
+{{"operation_type": "replace", "analysis": "Replacing all existing objects with new furniture"}}
+```
+- "design a cozy living room" →
+```json
+{{"operation_type": "replace", "analysis": "Designing room from scratch, replacing any existing objects"}}
+```
+- "add a desk and chair" →
 ```json
 {{"operation_type": "add", "analysis": "Adding furniture while keeping existing objects"}}
 ```
-- "remove the old sofa" → 
+- "remove the old sofa" →
 ```json
 {{"operation_type": "remove", "analysis": "Removing specific furniture", "objects_to_remove": ["sofa_id"]}}
 ```
@@ -1963,7 +1990,11 @@ Analyze the conditions now:"""
             
             # Validate the result
             if "operation_type" not in analysis_result:
-                analysis_result["operation_type"] = "add"
+                analysis_result["operation_type"] = "replace" if not room.objects else "add"
+            # Normalize operation_type to one of the three valid types
+            op_type = analysis_result.get("operation_type", "").lower()
+            if op_type not in ("add", "remove", "replace"):
+                analysis_result["operation_type"] = "replace" if not room.objects else "add"
             if "analysis" not in analysis_result:
                 analysis_result["analysis"] = "Analysis completed"
             if "objects_to_remove" not in analysis_result:
@@ -1973,10 +2004,18 @@ Analyze the conditions now:"""
             
         except json.JSONDecodeError:
             # Fallback parsing from text
-            if any(keyword in placement_conditions.lower() for keyword in ["add", "place additional", "also add", "include"]):
+            conditions_lower = placement_conditions.lower()
+            if any(keyword in conditions_lower for keyword in ["replace", "design", "furnish", "create", "redo", "setup", "from scratch"]):
+                return {"operation_type": "replace", "analysis": "Detected replace operation from keywords", "objects_to_remove": []}
+            elif any(keyword in conditions_lower for keyword in ["add", "place additional", "also add", "include", "more"]):
                 return {"operation_type": "add", "analysis": "Detected add operation from keywords", "objects_to_remove": []}
-            else:
+            elif any(keyword in conditions_lower for keyword in ["remove", "delete", "take away", "get rid of"]):
                 return {"operation_type": "remove", "analysis": "Detected remove operation from keywords", "objects_to_remove": []}
+            elif not room.objects:
+                # Room is empty, default to replace
+                return {"operation_type": "replace", "analysis": "Room has no objects, defaulting to replace", "objects_to_remove": []}
+            else:
+                return {"operation_type": "add", "analysis": "Defaulting to add operation", "objects_to_remove": []}
     
     except Exception as e:
         print(f"Error in analyze_placement_operation: {e}")
@@ -2186,6 +2225,12 @@ async def place_objects_in_room(ctx: Context, room_id: str = "", placement_condi
         - Operation type performed (add/remove/replace)
         - Summary of changes made to the room
         - Details about object selection and placement reasoning
+        - degradation_warning: if present, lists object types that keep failing - STOP retrying those types
+        - operation_type "limit_reached": room has hit the max object limit - STOP adding objects
+
+    [CRITICAL] OBJECT LIMIT: Each room has a maximum total object capacity (default 20).
+    If the response contains operation_type "limit_reached", you MUST stop adding objects to this room.
+    If the response contains "degradation_warning", do NOT retry the listed object types.
     """
     global current_layout
     global policy_analysis
@@ -2221,6 +2266,34 @@ async def place_objects_in_room(ctx: Context, room_id: str = "", placement_condi
     
     try:
         print(f"✅ Room found: {room.room_type} with {len(room.objects)} existing objects", file=sys.stderr)
+
+        # Determine operation type early so we can make smart limit decisions
+        room_area = room.dimensions.width * room.dimensions.length
+        area_based_limit = max(15, min(60, int(room_area * 1.5)))
+        max_total_objects = int(os.environ.get("SAGE_MAX_TOTAL_ROOM_OBJECTS", str(area_based_limit)))
+        current_object_count = len(room.objects)
+
+        # Analyze operation type first to decide whether to block
+        early_operation = await analyze_placement_operation(room, placement_conditions)
+        op_type = early_operation.get("operation_type", "add")
+
+        if current_object_count >= max_total_objects and op_type == "add":
+            print(f"🛑 Room {room_id} at max objects ({current_object_count}/{max_total_objects}), ADD blocked", file=sys.stderr)
+            return json.dumps({
+                "success": True,
+                "room_id": room_id,
+                "operation_type": "limit_reached",
+                "message": f"Room has {current_object_count}/{max_total_objects} objects. ADD is blocked, but you can still use MOVE or REPLACE to refine placement. Use move_one_object_with_condition_in_room to fix orientations and positions. Use place_objects_in_room with REPLACE mode to swap objects without increasing count.",
+                "all_objects": get_object_description_list(room.objects),
+                "placed_objects": [],
+                "failed_to_be_placed_objects": [],
+                "next_action": "Use MOVE or REPLACE to refine the room layout. Do NOT use ADD."
+            })
+
+        # Calculate remaining budget for new objects
+        remaining_budget = max_total_objects - current_object_count
+        if remaining_budget < 5:
+            print(f"⚠️ Room {room_id} is near max objects ({current_object_count}/{max_total_objects}), only {remaining_budget} slots left", file=sys.stderr)
         
         # Check if API key is available
         api_key = ANTHROPIC_API_KEY
@@ -2235,7 +2308,7 @@ async def place_objects_in_room(ctx: Context, room_id: str = "", placement_condi
         
         # Analyze placement conditions to determine operation type (add/remove/replace)
         print("🔍 Analyzing placement conditions to determine operation type...", file=sys.stderr)
-        operation_analysis = await analyze_placement_operation(room, placement_conditions)
+        operation_analysis = early_operation  # reuse early analysis from limit check
         print(f"📊 Operation analysis complete - Type: {operation_analysis['operation_type']}", file=sys.stderr)
         
         # Prepare room information for Claude
@@ -2573,12 +2646,32 @@ Focus on physical details for 3D generation."""
             # Select new objects from recommendations
             print("🎯 Selecting new objects from Claude recommendations...", file=sys.stderr)
 
+            # Auto-degrade repeatedly failing object types: reduce size by 30%
+            if room_id in _object_failure_tracker:
+                for obj_name, obj_data in claude_recommendations.items():
+                    if isinstance(obj_data, dict):
+                        obj_type = obj_name.lower().replace(" ", "_")
+                        fail_count = _object_failure_tracker[room_id].get(obj_type, 0)
+                        if fail_count >= 2:
+                            old_size = obj_data.get("size", [100, 50, 75])
+                            # Ensure degraded size is always <= original, with a min of 2cm
+                            new_size = [max(2, min(old_size[i], int(old_size[i] * 0.7))) for i in range(3)]
+                            obj_data["size"] = new_size
+                            obj_data["quantity"] = max(1, int(obj_data.get("quantity", 1)) - fail_count + 1)
+                            print(f"  ⚠️ Auto-degraded {obj_name}: size {old_size}→{new_size}, fail_count={fail_count}", file=sys.stderr)
+                        elif fail_count >= 1:
+                            # Slight reduction for single failure
+                            old_size = obj_data.get("size", [100, 50, 75])
+                            new_size = [max(2, min(old_size[i], int(old_size[i] * 0.85))) for i in range(3)]
+                            obj_data["size"] = new_size
+                            print(f"  ⚠️ Slight degrade {obj_name}: size {old_size}→{new_size}", file=sys.stderr)
+
             # Limit the number of keys in claude_recommendations up to 5
             # if len(claude_recommendations) > 15:
             #     claude_recommendations = {k: v for k, v in claude_recommendations.items() if k in list(claude_recommendations.keys())[:15]}
             
             # print(f"claude_recommendations: {claude_recommendations}", file=sys.stderr)
-            selected_objects, updated_recommendation_list = select_objects(claude_recommendations, room, room.objects, current_layout)
+            selected_objects, updated_recommendation_list = select_objects(claude_recommendations, room, room.objects, current_layout, max_new_objects=remaining_budget)
             print(f"✅ Object selection complete - {len(selected_objects)} new objects selected", file=sys.stderr)
 
             # Combine with existing objects for add operations
@@ -2636,7 +2729,24 @@ Focus on physical details for 3D generation."""
 
         if "failed_to_be_placed_objects" in claude_placement_interactions:
             result["failed_to_be_placed_objects"] = get_failed_placements_description(claude_placement_interactions["failed_to_be_placed_objects"])
-        
+
+            # Track failures for auto-degradation
+            if room_id not in _object_failure_tracker:
+                _object_failure_tracker[room_id] = {}
+            for failed_obj in claude_placement_interactions["failed_to_be_placed_objects"]:
+                obj_type = failed_obj.type if hasattr(failed_obj, 'type') else str(failed_obj)
+                _object_failure_tracker[room_id][obj_type] = _object_failure_tracker[room_id].get(obj_type, 0) + 1
+
+        # Auto-degradation: warn about repeatedly failing object types
+        if room_id in _object_failure_tracker:
+            repeat_failures = {obj_type: count for obj_type, count in _object_failure_tracker[room_id].items() if count >= 2}
+            if repeat_failures:
+                degraded_types = list(repeat_failures.keys())
+                result["degradation_warning"] = (
+                    f"The following object types have failed placement {repeat_failures} times: {degraded_types}. "
+                    "DO NOT retry these exact objects. Either try significantly smaller alternatives or skip them entirely."
+                )
+
         result["all_objects"] = get_object_description_list(final_room_objects)
 
         # Add operation-specific information
@@ -3649,13 +3759,37 @@ At most 1-2 object adjustment analysis recommendations.
             })
         
         # Step 6: Prepare final analysis result
+        # Determine room quality from Claude's analysis
+        analysis_summary = claude_analysis.get("analysis_summary", {})
+        room_rating = analysis_summary.get("overall_room_rating", "fair")
+
+        # Dynamic notice based on room quality
+        if room_rating in ("excellent", "good"):
+            notice = (
+                f"The room is rated '{room_rating}'. Only minor improvements needed if any. "
+                "Focus on fixing specific issues rather than adding many more objects. "
+                "Consider stopping if all major issues are resolved."
+            )
+        elif room_rating == "fair":
+            notice = (
+                "The room is rated 'fair'. Address the modification suggestions below to fix placement/orientation issues. "
+                "Add only the most important missing objects. Do NOT over-add."
+            )
+        else:  # poor or unknown
+            notice = (
+                "The room is rated 'poor'. Address the critical modification suggestions first, "
+                "then add essential missing objects. Focus on quality over quantity."
+            )
+
         result = {
             "success": True,
             "room_id": room_id,
             "room_type": room.room_type,
-            "notice": "[IMPORTANT] You need to keep calling tools to improve the room quality!!! Follow the following next step instructions to improve the room quality!!! You can combine the following object addition actions into one call to place_objects_in_room(room_id, [action1] [action2] [action3] ... ) if necessary.",
+            "room_rating": room_rating,
+            "analysis_reasoning": analysis_summary.get("detailed_reasoning", "")[:800],
+            "notice": notice,
             "next_step": {
-                "actions": []  # Single list sorted by score
+                "actions": []  # Modification actions first, then addition actions
             },
         }
 
@@ -3770,18 +3904,86 @@ At most 1-2 object adjustment analysis recommendations.
         
         # Separate modification actions (REMOVE/REPLACE/MOVE) from existing analysis
         top_modifications = modification_actions[:max_recommendations] if max_recommendations > 0 else modification_actions
-        
-        # Combine object addition actions (all) with limited modification actions
-        if propose_modifications:
-            # Return all object additions + limited modifications
-            # result["next_step"]["actions"] = [object_addition_actions] + top_modifications
-            if int(highest_priority_adjust) > int(highest_priority_add):
-                result["next_step"]["actions"] = top_modifications
-            else:
-                result["next_step"]["actions"] = [object_addition_actions]
+
+        # Always include modification actions first (they fix placement/orientation issues)
+        # Then include addition actions (they fill missing objects)
+        all_actions = []
+        if propose_modifications and top_modifications:
+            all_actions.extend(top_modifications)
+        if object_addition_actions and object_addition_actions.get("actions", "").strip():
+            all_actions.append(object_addition_actions)
+
+        result["next_step"]["actions"] = all_actions
+
+        # Check if the scene quality is good enough to stop
+        all_scores = []
+        for obj_analysis in claude_analysis.get("object_existing_analysis", []):
+            for issue in obj_analysis.get("issues_found", []):
+                all_scores.append(int(issue.get("score", 5)))
+        for combo in claude_analysis.get("object_addition_analysis", {}).get("object_combos_analysis", []):
+            all_scores.append(int(combo.get("priority", 5)))
+        for bg in claude_analysis.get("object_addition_analysis", {}).get("background_objects_analysis", []):
+            all_scores.append(int(bg.get("priority", 5)))
+
+        max_score = max(all_scores) if all_scores else 0
+        avg_score = sum(all_scores) / len(all_scores) if all_scores else 0
+
+        # Convergence-based stop detection: track scores across critic calls
+        if room_id not in _critic_score_history:
+            _critic_score_history[room_id] = []
+        _critic_score_history[room_id].append(max_score)
+        score_history = _critic_score_history[room_id]
+
+        # Determine if we should stop based on convergence, not absolute threshold
+        should_stop = False
+        stop_reason = ""
+
+        # Rule 1: Absolute threshold (rarely triggers but kept for edge cases)
+        if max_score <= stop_scene_generation_threshold:
+            should_stop = True
+            stop_reason = f"All issues below threshold (max={max_score} <= {stop_scene_generation_threshold})"
+
+        # Rule 2: Convergence — scores stopped improving for 2+ consecutive critic calls
+        elif len(score_history) >= 3:
+            last_3 = score_history[-3:]
+            if last_3[-1] == last_3[-2] == last_3[-1] and last_3[0] == last_3[1]:
+                # All last 3 scores are the same — stuck
+                current_obj_count = len(room.objects)
+                room_area = room.dimensions.width * room.dimensions.length
+                area_based_max = max(15, min(60, int(room_area * 1.5)))
+                max_total = int(os.environ.get("SAGE_MAX_TOTAL_ROOM_OBJECTS", str(area_based_max)))
+                if current_obj_count >= max_total * 0.5:
+                    should_stop = True
+                    stop_reason = (
+                        f"Critic scores have plateaued at max={max_score} for {len(score_history)} consecutive calls "
+                        f"({current_obj_count}/{max_total} objects). The room has reached its quality ceiling."
+                    )
+            elif last_3[-1] >= last_3[-2] and last_3[-2] >= last_3[0]:
+                # Scores trending up or flat for 3 calls (not improving)
+                current_obj_count = len(room.objects)
+                room_area = room.dimensions.width * room.dimensions.length
+                area_based_max = max(15, min(60, int(room_area * 1.5)))
+                max_total = int(os.environ.get("SAGE_MAX_TOTAL_ROOM_OBJECTS", str(area_based_max)))
+                if current_obj_count >= max_total * 0.6 and last_3[-1] <= 8:
+                    should_stop = True
+                    stop_reason = (
+                        f"Critic scores not improving (history: {score_history[-3:]}) "
+                        f"and room is near capacity ({current_obj_count}/{max_total}). Quality ceiling reached."
+                    )
+
+        if should_stop:
+            result["stop_scene_generation"] = True
+            result["stop_reason"] = stop_reason
+            result["critic_score_history"] = score_history
+            result["notice"] = (
+                f"Room rated '{room_rating}'. {stop_reason}. "
+                "The scene has reached its quality ceiling. Verify completion conditions and STOP."
+            )
         else:
-            # Return only object additions
-            result["next_step"]["actions"] = object_addition_actions
+            result["stop_scene_generation"] = False
+            result["max_issue_score"] = max_score
+            result["stop_threshold"] = stop_scene_generation_threshold
+            result["critic_score_history"] = score_history
         
         
 
@@ -3838,7 +4040,15 @@ async def room_physics_critic(room_id: str):
     result = create_single_room_layout_scene(output_path, room_id)
     if result['status'] != 'success':
         return result
-    
+
+    # Export USD file for interactive preview in Isaac Sim
+    usd_path = os.path.join(output_path, f"{room_id}.usd")
+    try:
+        usd_result = get_room_layout_scene_usd(output_path, usd_path)
+        print(f"USD exported: {usd_path} ({usd_result.get('status', 'unknown')})", file=sys.stderr)
+    except Exception as e:
+        print(f"USD export failed (non-fatal): {e}", file=sys.stderr)
+
     result = simulate_the_scene()
     # get the result dict to json string
     result = json.dumps(result)

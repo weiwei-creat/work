@@ -283,6 +283,8 @@ class SensorBase(ABC):
 
     def _update_outdated_buffers(self):
         """Fills the sensor data for the outdated sensors."""
+        if not hasattr(self, "_is_outdated"):
+            return
         outdated_env_ids = self._is_outdated.nonzero().squeeze(-1)
         if len(outdated_env_ids) > 0:
             # obtain new data

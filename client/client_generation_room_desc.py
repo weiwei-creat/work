@@ -147,9 +147,20 @@ SOURCE 1: Scene Requirements (from layout generation)
 
 SOURCE 2: Semantic Critic Info Recommendations
 - Review the placement recommendations in semantic critic info
-- Identify the most urgent objects that need to be placed
-- Combine all recommended actions and place those objects together
-- [CRITICAL] Follow these recommendations closely - they identify what's missing
+- [CRITICAL] Check for "stop_scene_generation": true — if present, the room is good enough, verify conditions and STOP
+- Check "room_rating": if "excellent" or "good", focus on fixing specific issues, NOT adding more objects
+- Check "analysis_reasoning" for detailed problem descriptions
+
+--- MOVE/REPLACE/REMOVE actions (HIGHEST PRIORITY) ---
+- [CRITICAL] If next_step actions contain Priority scores >= 7 for MOVE/REPLACE/REMOVE, you MUST fix these BEFORE adding any new objects
+- Use move_one_object_with_condition_in_room(room_id, condition) for each MOVE action
+- The condition format must follow: "Move [object_type] (object_id: [object_id]) to [floor|wall|object_id], [spatial_guidance]"
+- Example: if critic says "Rotate chair to face desk", call move_one_object_with_condition_in_room with the chair's object_id
+
+--- ADD actions (lower priority) ---
+- Only add new objects AFTER all high-priority MOVE/REPLACE fixes are done
+- Combine ADD actions into one place_objects_in_room call
+- Do NOT over-add — respect the room_rating guidance
 
 SOURCE 3: Failed Placements (Retry Logic)
 - If object placement fails, RETRY ONCE with the same or similar objects
@@ -173,6 +184,9 @@ FORBIDDEN OBJECTS:
 
 REPLACEMENT WARNING:
 [CRITICAL] NEVER use "replace all objects" - this removes everything you've placed
+
+LIMIT HANDLING:
+[CRITICAL] If you receive operation_type "limit_reached", do NOT stop immediately. The room may still need refinement. Use move_one_object_with_condition_in_room to fix orientations and positions. Use place_objects_in_room with REPLACE mode to swap problematic objects without increasing object count. Only stop when all orientations and placements look correct.
 
 --- 2.4 STYLE CONSISTENCY ---
 
@@ -220,13 +234,14 @@ Your scene MUST achieve the following:
 
 [CRITICAL] You MUST keep track of the current object placement status continuously.
 
-DO NOT STOP until ALL of the following conditions are met:
+DO NOT STOP until ALL of the following conditions are met (OR stop_scene_generation is signaled):
 
+□ CONDITION 0: [HIGHEST PRIORITY] If semantic critic returns "stop_scene_generation": true, the room quality is sufficient — verify and STOP
 □ CONDITION 1: All necessary large AND small items are present with rich details
 □ CONDITION 2: Every shelf is full of objects (>5 items per shelf)
 □ CONDITION 3: Every supporter surface (tables, desks, shelves, counters) has small objects on it
 □ CONDITION 4: All scene requirements from layout generation are satisfied
-□ CONDITION 5: All semantic critic recommendations have been addressed
+□ CONDITION 5: All semantic critic modification recommendations (MOVE/REPLACE/REMOVE) have been addressed
 
 BEFORE STOPPING:
 [CRITICAL] Explicitly verify each condition above

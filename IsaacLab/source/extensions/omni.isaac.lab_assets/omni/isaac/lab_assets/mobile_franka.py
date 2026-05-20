@@ -33,7 +33,7 @@ OMRON_PANDA_CFG = ArticulationCfg(
             # max_depenetration_velocity=5.0,
         ),
         # mass_props=sim_utils.MassPropertiesCfg(mass=10.0),
-        asset_path="/home/hongchix/main/curobo/src/curobo/content/assets/robot/omron_franka/composed_robot.urdf",
+        asset_path="/home/gaok/anaconda3/envs/env_isaaclab/lib/python3.11/site-packages/curobo/content/assets/robot/franka_description/composed_robot_sage.urdf",
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(
             enabled_self_collisions=False, solver_position_iteration_count=16, solver_velocity_iteration_count=4
         ),
@@ -140,7 +140,7 @@ MOBILE_FRANKA_PANDA_CFG = ArticulationCfg(
             torsional_patch_radius=0.1, # Add for rotational friction
         ),
         # mass_props=sim_utils.MassPropertiesCfg(mass=10.0),
-        asset_path="/home/hongchix/main/curobo/src/curobo/content/assets/robot/omron_franka/composed_robot.urdf",
+        asset_path="/home/gaok/anaconda3/envs/env_isaaclab/lib/python3.11/site-packages/curobo/content/assets/robot/franka_description/composed_robot_sage.urdf",
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(
             enabled_self_collisions=False, 
             solver_position_iteration_count=16, 

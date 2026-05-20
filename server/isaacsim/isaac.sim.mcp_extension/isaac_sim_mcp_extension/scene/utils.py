@@ -28,7 +28,8 @@ print("isaac_ext_dir:", isaac_ext_dir)
 if os.path.islink(isaac_ext_dir):
     isaac_ext_dir = os.readlink(isaac_ext_dir)
 print("isaac_ext_dir:", isaac_ext_dir)
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(isaac_ext_dir))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(isaac_ext_dir)))
+from material_fallbacks import ensure_material_file
 
 # from constants import SERVER_ROOT_DIR
 SERVER_ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(isaac_ext_dir)))
@@ -274,6 +275,9 @@ def apply_object_transform(mesh: trimesh.Trimesh, obj: Object) -> trimesh.Trimes
     """
     # Create a copy of the mesh to avoid modifying the original
     transformed_mesh = mesh.copy()
+
+    if _is_wall_mounted_place_id(obj.place_id):
+        _align_wall_mounted_mesh_axes(transformed_mesh)
     
     # Convert Euler angles from degrees to radians
     rx_rad = np.radians(obj.rotation.x)
@@ -303,6 +307,51 @@ def apply_object_transform(mesh: trimesh.Trimesh, obj: Object) -> trimesh.Trimes
     transformed_mesh.apply_transform(final_transform)
     
     return transformed_mesh
+
+
+def _align_wall_mounted_mesh_axes(mesh: trimesh.Trimesh) -> None:
+    extents = np.asarray(mesh.extents, dtype=np.float64)
+    if extents.shape[0] != 3 or np.any(extents <= 1e-6):
+        return
+
+    thin_axis = int(np.argmin(extents))
+    if thin_axis == 1:
+        return
+
+    remaining_axes = [axis for axis in range(3) if axis != thin_axis]
+    height_axis = max(remaining_axes, key=lambda axis: extents[axis])
+    width_axis = next(axis for axis in remaining_axes if axis != height_axis)
+
+    remap = np.zeros((4, 4), dtype=np.float64)
+    remap[3, 3] = 1.0
+    remap[0, width_axis] = 1.0
+    remap[1, thin_axis] = 1.0
+    remap[2, height_axis] = 1.0
+
+    center = mesh.bounds.mean(axis=0)
+    transform = (
+        trimesh.transformations.translation_matrix(center)
+        @ remap
+        @ trimesh.transformations.translation_matrix(-center)
+    )
+    mesh.apply_transform(transform)
+
+
+def _is_wall_mounted_place_id(place_id: str) -> bool:
+    place_id = (place_id or "").lower()
+    return place_id == "wall" or place_id.startswith("wall")
+
+
+def _room_material_texture_path(layout_id: str, material_name: str, surface_type: str) -> str:
+    texture_path = f"{SERVER_ROOT_DIR}/results/{layout_id}/materials/{material_name}.png"
+    return ensure_material_file(texture_path, surface_type)
+
+
+def _texture_path_for_wall(layout_id: str, room: Room, wall_id: str) -> str:
+    wall_map = {wall.id: wall for wall in room.walls}
+    wall = wall_map.get(wall_id)
+    material_name = wall.material if wall is not None else room.walls[0].material
+    return _room_material_texture_path(layout_id, material_name, "wall")
 
 
 
@@ -744,7 +793,7 @@ def export_layout_to_mesh_dict_list(layout: FloorPlan):
     for room in layout.rooms:
         # Create floor mesh
         floor_mesh = create_floor_mesh(room)
-        floor_mesh_texture_map_path = f"{layout_save_dir}/{layout.id}/materials/{room.floor_material}.png"
+        floor_mesh_texture_map_path = _room_material_texture_path(layout.id, room.floor_material, "floor")
         # TODO: generate tex coords for floor mesh
         floor_mesh_tex_coords = create_floor_mesh_tex_coords(floor_mesh)
         # floor_meshes.append(floor_mesh)
@@ -768,9 +817,8 @@ def export_layout_to_mesh_dict_list(layout: FloorPlan):
         # door_meshes.extend(room_door_meshes)
         # window_meshes.extend(room_window_meshes)
 
-        wall_mesh_texture_map_path = f"{layout_save_dir}/{layout.id}/materials/{room.walls[0].material}.png"
-
         for wall_id, wall_mesh in zip(room_wall_ids, room_wall_meshes):
+            wall_mesh_texture_map_path = _texture_path_for_wall(layout.id, room, wall_id)
             # TODO: generate tex coords for wall mesh
             wall_mesh_tex_coords = create_wall_mesh_tex_coords(wall_mesh)
             mesh_info_dict[f"{wall_id}"] = {
@@ -831,7 +879,7 @@ def export_layout_to_mesh_dict_list(layout: FloorPlan):
 
                 mesh_info_dict[obj.id] = {
                     "mesh": transformed_mesh,
-                    "static": False if obj.place_id != "wall" else True,
+                    "static": _is_wall_mounted_place_id(obj.place_id),
                     "texture": texture_info,
                     "mass": getattr(obj, 'mass', 1.0),
                     "transform": {
@@ -1034,7 +1082,7 @@ def export_layout_to_mesh_dict_list_no_object_transform(layout: FloorPlan):
     for room in layout.rooms:
         # Create floor mesh
         floor_mesh = create_floor_mesh(room)
-        floor_mesh_texture_map_path = f"{layout_save_dir}/{layout.id}/materials/{room.floor_material}.png"
+        floor_mesh_texture_map_path = _room_material_texture_path(layout.id, room.floor_material, "floor")
         # TODO: generate tex coords for floor mesh
         floor_mesh_tex_coords = create_floor_mesh_tex_coords(floor_mesh)
         # floor_meshes.append(floor_mesh)
@@ -1058,9 +1106,8 @@ def export_layout_to_mesh_dict_list_no_object_transform(layout: FloorPlan):
         # door_meshes.extend(room_door_meshes)
         # window_meshes.extend(room_window_meshes)
 
-        wall_mesh_texture_map_path = f"{layout_save_dir}/{layout.id}/materials/{room.walls[0].material}.png"
-
         for wall_id, wall_mesh in zip(room_wall_ids, room_wall_meshes):
+            wall_mesh_texture_map_path = _texture_path_for_wall(layout.id, room, wall_id)
             # TODO: generate tex coords for wall mesh
             wall_mesh_tex_coords = create_wall_mesh_tex_coords(wall_mesh)
             mesh_info_dict[f"{wall_id}"] = {
@@ -1123,7 +1170,7 @@ def export_layout_to_mesh_dict_list_no_object_transform(layout: FloorPlan):
 
                 mesh_info_dict[obj.id] = {
                     "mesh": obj_mesh,
-                    "static": False if obj.place_id != "wall" else True,
+                    "static": _is_wall_mounted_place_id(obj.place_id),
                     "texture": texture_info,
                     "mass": getattr(obj, 'mass', 1.0),
                     "transform": {
@@ -1441,7 +1488,7 @@ def export_single_room_layout_to_mesh_dict_list(layout: FloorPlan, room_id: str)
     
     # Create floor mesh
     floor_mesh = create_floor_mesh(room)
-    floor_mesh_texture_map_path = f"{layout_save_dir}/{layout.id}/materials/{room.floor_material}.png"
+    floor_mesh_texture_map_path = _room_material_texture_path(layout.id, room.floor_material, "floor")
     # TODO: generate tex coords for floor mesh
     floor_mesh_tex_coords = create_floor_mesh_tex_coords(floor_mesh)
     # floor_meshes.append(floor_mesh)
@@ -1465,9 +1512,8 @@ def export_single_room_layout_to_mesh_dict_list(layout: FloorPlan, room_id: str)
     # door_meshes.extend(room_door_meshes)
     # window_meshes.extend(room_window_meshes)
 
-    wall_mesh_texture_map_path = f"{layout_save_dir}/{layout.id}/materials/{room.walls[0].material}.png"
-
     for wall_id, wall_mesh in zip(room_wall_ids, room_wall_meshes):
+        wall_mesh_texture_map_path = _texture_path_for_wall(layout.id, room, wall_id)
         # TODO: generate tex coords for wall mesh
         wall_mesh_tex_coords = create_wall_mesh_tex_coords(wall_mesh)
         mesh_info_dict[f"{wall_id}"] = {
@@ -1500,19 +1546,24 @@ def export_single_room_layout_to_mesh_dict_list(layout: FloorPlan, room_id: str)
 
         window_mesh_texture_map_path = f"{layout_save_dir}/{layout.id}/materials/{window_id}_texture.png"
         window_mesh_tex_coords_save_path = f"{layout_save_dir}/{layout.id}/materials/{window_id}_tex_coords.pkl"
-        with open(window_mesh_tex_coords_save_path, "rb") as f:
-            window_mesh_tex_coords = pickle.load(f)
-
-        mesh_info_dict[f"{window_id}"] = {
-            "mesh": window_mesh,
-            "static": True,
-            "texture": {
+        try:
+            with open(window_mesh_tex_coords_save_path, "rb") as f:
+                window_mesh_tex_coords = pickle.load(f)
+            window_texture = {
                 "vts": window_mesh_tex_coords["vts"],
                 "fts": window_mesh_tex_coords["fts"],
                 "texture_map_path": window_mesh_texture_map_path
             }
-        }
-            
+        except (FileNotFoundError, IOError, OSError) as e:
+            print(f"Warning: Window texture not found for {window_id}: {e}", file=sys.stderr)
+            window_texture = None
+
+        if window_texture is not None:
+            mesh_info_dict[f"{window_id}"] = {
+                "mesh": window_mesh,
+                "static": True,
+                "texture": window_texture
+            }
     
     # Combine all meshes with appropriate colors
     # background_meshes = []
@@ -1555,7 +1606,7 @@ def export_single_room_layout_to_mesh_dict_list(layout: FloorPlan, room_id: str)
 
             mesh_info_dict[obj.id] = {
                 "mesh": transformed_mesh,
-                "static": False if obj.place_id != "wall" else True,
+                "static": _is_wall_mounted_place_id(obj.place_id),
                 "texture": texture_info,
                 "mass": getattr(obj, 'mass', 1.0)
             }
@@ -1636,14 +1687,38 @@ def export_single_room_layout_to_mesh_dict_list(layout: FloorPlan, room_id: str)
         door_mesh_texture_map_path = f"{layout_save_dir}/{layout.id}/materials/{door.door_material}_texture.png"
 
         door_mesh_tex_coords_save_path = f"{layout_save_dir}/{layout.id}/materials/{door.door_material}_tex_coords.pkl"
-        with open(door_mesh_tex_coords_save_path, "rb") as f:
-            door_mesh_tex_coords = pickle.load(f)
-
-        texture_info = {
-            "vts": door_mesh_tex_coords["vts"],
-            "fts": door_mesh_tex_coords["fts"],
-            "texture_map_path": door_mesh_texture_map_path
-        }
+        try:
+            with open(door_mesh_tex_coords_save_path, "rb") as f:
+                door_mesh_tex_coords = pickle.load(f)
+            texture_info = {
+                "vts": door_mesh_tex_coords["vts"],
+                "fts": door_mesh_tex_coords["fts"],
+                "texture_map_path": door_mesh_texture_map_path
+            }
+        except (FileNotFoundError, IOError, OSError) as e:
+            print(f"Warning: Door texture not found for {door.id} (material={door.door_material}): {e}", file=sys.stderr)
+            # Fallback: try to find any available door texture in the materials folder
+            materials_dir = f"{layout_save_dir}/{layout.id}/materials"
+            fallback_texture = None
+            try:
+                for fname in sorted(os.listdir(materials_dir)):
+                    if fname.startswith("Door_") and fname.endswith("_texture.png"):
+                        candidate_id = fname[:-len("_texture.png")]
+                        candidate_tex_path = os.path.join(materials_dir, f"{candidate_id}_tex_coords.pkl")
+                        candidate_img_path = os.path.join(materials_dir, fname)
+                        if os.path.exists(candidate_tex_path):
+                            with open(candidate_tex_path, "rb") as cf:
+                                candidate_tex = pickle.load(cf)
+                            fallback_texture = {
+                                "vts": candidate_tex["vts"],
+                                "fts": candidate_tex["fts"],
+                                "texture_map_path": candidate_img_path
+                            }
+                            print(f"  Using fallback door texture: {candidate_id}", file=sys.stderr)
+                            break
+            except Exception:
+                pass
+            texture_info = fallback_texture
 
 
         mesh_info_dict[f"{door.id}"] = {
@@ -1657,20 +1732,26 @@ def export_single_room_layout_to_mesh_dict_list(layout: FloorPlan, room_id: str)
         # Use door-specific frame texture based on door material
         door_frame_texture_map_path = f"{layout_save_dir}/{layout.id}/materials/{door.door_material}_frame_texture.png"
         door_frame_tex_coords_save_path = f"{layout_save_dir}/{layout.id}/materials/{door.door_material}_frame_tex_coords.pkl"
-        
+
         # Check if door frame texture files exist, if not use door material as fallback
         if not os.path.exists(door_frame_tex_coords_save_path):
             door_frame_texture_map_path = door_mesh_texture_map_path
             door_frame_tex_coords_save_path = door_mesh_tex_coords_save_path
-        
-        with open(door_frame_tex_coords_save_path, "rb") as f:
-            door_frame_tex_coords = pickle.load(f)
 
-        door_frame_texture_info = {
-            "vts": door_frame_tex_coords["vts"],
-            "fts": door_frame_tex_coords["fts"],
-            "texture_map_path": door_frame_texture_map_path
-        }
+        if door_frame_tex_coords_save_path and os.path.exists(door_frame_tex_coords_save_path):
+            try:
+                with open(door_frame_tex_coords_save_path, "rb") as f:
+                    door_frame_tex_coords = pickle.load(f)
+                door_frame_texture_info = {
+                    "vts": door_frame_tex_coords["vts"],
+                    "fts": door_frame_tex_coords["fts"],
+                    "texture_map_path": door_frame_texture_map_path
+                }
+            except (FileNotFoundError, IOError, OSError) as e:
+                print(f"Warning: Door frame texture not found for {door.id}: {e}", file=sys.stderr)
+                door_frame_texture_info = texture_info  # Fallback to door texture
+        else:
+            door_frame_texture_info = texture_info  # Fallback to door texture (or None)
 
         mesh_info_dict[f"{door.id}_frame"] = {
             "mesh": door_frame_mesh,
@@ -1727,7 +1808,7 @@ def export_single_room_layout_to_mesh_dict_list_from_room(room: Room, layout_id:
 
     # Create floor mesh
     floor_mesh = create_floor_mesh(room)
-    floor_mesh_texture_map_path = f"{layout_save_dir}/{layout_id}/materials/{room.floor_material}.png"
+    floor_mesh_texture_map_path = _room_material_texture_path(layout_id, room.floor_material, "floor")
     # TODO: generate tex coords for floor mesh
     floor_mesh_tex_coords = create_floor_mesh_tex_coords(floor_mesh)
     # floor_meshes.append(floor_mesh)
@@ -1751,9 +1832,8 @@ def export_single_room_layout_to_mesh_dict_list_from_room(room: Room, layout_id:
     # door_meshes.extend(room_door_meshes)
     # window_meshes.extend(room_window_meshes)
 
-    wall_mesh_texture_map_path = f"{layout_save_dir}/{layout_id}/materials/{room.walls[0].material}.png"
-
     for wall_id, wall_mesh in zip(room_wall_ids, room_wall_meshes):
+        wall_mesh_texture_map_path = _texture_path_for_wall(layout_id, room, wall_id)
         # TODO: generate tex coords for wall mesh
         wall_mesh_tex_coords = create_wall_mesh_tex_coords(wall_mesh)
         mesh_info_dict[f"{wall_id}"] = {
@@ -1786,19 +1866,24 @@ def export_single_room_layout_to_mesh_dict_list_from_room(room: Room, layout_id:
 
         window_mesh_texture_map_path = f"{layout_save_dir}/{layout_id}/materials/{window_id}_texture.png"
         window_mesh_tex_coords_save_path = f"{layout_save_dir}/{layout_id}/materials/{window_id}_tex_coords.pkl"
-        with open(window_mesh_tex_coords_save_path, "rb") as f:
-            window_mesh_tex_coords = pickle.load(f)
-
-        mesh_info_dict[f"{window_id}"] = {
-            "mesh": window_mesh,
-            "static": True,
-            "texture": {
+        try:
+            with open(window_mesh_tex_coords_save_path, "rb") as f:
+                window_mesh_tex_coords = pickle.load(f)
+            window_texture = {
                 "vts": window_mesh_tex_coords["vts"],
                 "fts": window_mesh_tex_coords["fts"],
                 "texture_map_path": window_mesh_texture_map_path
             }
-        }
-            
+        except (FileNotFoundError, IOError, OSError) as e:
+            print(f"Warning: Window texture not found for {window_id}: {e}", file=sys.stderr)
+            window_texture = None
+
+        if window_texture is not None:
+            mesh_info_dict[f"{window_id}"] = {
+                "mesh": window_mesh,
+                "static": True,
+                "texture": window_texture
+            }
     
     # Combine all meshes with appropriate colors
     # background_meshes = []
@@ -1841,7 +1926,7 @@ def export_single_room_layout_to_mesh_dict_list_from_room(room: Room, layout_id:
 
             mesh_info_dict[obj.id] = {
                 "mesh": transformed_mesh,
-                "static": False if obj.place_id != "wall" else True,
+                "static": _is_wall_mounted_place_id(obj.place_id),
                 "texture": texture_info,
                 "mass": getattr(obj, 'mass', 1.0)
             }
@@ -1924,14 +2009,38 @@ def export_single_room_layout_to_mesh_dict_list_from_room(room: Room, layout_id:
         door_mesh_texture_map_path = f"{layout_save_dir}/{layout_id}/materials/{door.door_material}_texture.png"
 
         door_mesh_tex_coords_save_path = f"{layout_save_dir}/{layout_id}/materials/{door.door_material}_tex_coords.pkl"
-        with open(door_mesh_tex_coords_save_path, "rb") as f:
-            door_mesh_tex_coords = pickle.load(f)
-
-        texture_info = {
-            "vts": door_mesh_tex_coords["vts"],
-            "fts": door_mesh_tex_coords["fts"],
-            "texture_map_path": door_mesh_texture_map_path
-        }
+        try:
+            with open(door_mesh_tex_coords_save_path, "rb") as f:
+                door_mesh_tex_coords = pickle.load(f)
+            texture_info = {
+                "vts": door_mesh_tex_coords["vts"],
+                "fts": door_mesh_tex_coords["fts"],
+                "texture_map_path": door_mesh_texture_map_path
+            }
+        except (FileNotFoundError, IOError, OSError) as e:
+            print(f"Warning: Door texture not found for {door.id} (material={door.door_material}): {e}", file=sys.stderr)
+            # Fallback: try to find any available door texture in the materials folder
+            materials_dir = f"{layout_save_dir}/{layout_id}/materials"
+            fallback_texture = None
+            try:
+                for fname in sorted(os.listdir(materials_dir)):
+                    if fname.startswith("Door_") and fname.endswith("_texture.png"):
+                        candidate_id = fname[:-len("_texture.png")]
+                        candidate_tex_path = os.path.join(materials_dir, f"{candidate_id}_tex_coords.pkl")
+                        candidate_img_path = os.path.join(materials_dir, fname)
+                        if os.path.exists(candidate_tex_path):
+                            with open(candidate_tex_path, "rb") as cf:
+                                candidate_tex = pickle.load(cf)
+                            fallback_texture = {
+                                "vts": candidate_tex["vts"],
+                                "fts": candidate_tex["fts"],
+                                "texture_map_path": candidate_img_path
+                            }
+                            print(f"  Using fallback door texture: {candidate_id}", file=sys.stderr)
+                            break
+            except Exception:
+                pass
+            texture_info = fallback_texture
 
 
         mesh_info_dict[f"{door.id}"] = {
@@ -1945,20 +2054,26 @@ def export_single_room_layout_to_mesh_dict_list_from_room(room: Room, layout_id:
         # Use door-specific frame texture based on door material
         door_frame_texture_map_path = f"{layout_save_dir}/{layout_id}/materials/{door.door_material}_frame_texture.png"
         door_frame_tex_coords_save_path = f"{layout_save_dir}/{layout_id}/materials/{door.door_material}_frame_tex_coords.pkl"
-        
+
         # Check if door frame texture files exist, if not use door material as fallback
         if not os.path.exists(door_frame_tex_coords_save_path):
             door_frame_texture_map_path = door_mesh_texture_map_path
             door_frame_tex_coords_save_path = door_mesh_tex_coords_save_path
-        
-        with open(door_frame_tex_coords_save_path, "rb") as f:
-            door_frame_tex_coords = pickle.load(f)
 
-        door_frame_texture_info = {
-            "vts": door_frame_tex_coords["vts"],
-            "fts": door_frame_tex_coords["fts"],
-            "texture_map_path": door_frame_texture_map_path
-        }
+        if door_frame_tex_coords_save_path and os.path.exists(door_frame_tex_coords_save_path):
+            try:
+                with open(door_frame_tex_coords_save_path, "rb") as f:
+                    door_frame_tex_coords = pickle.load(f)
+                door_frame_texture_info = {
+                    "vts": door_frame_tex_coords["vts"],
+                    "fts": door_frame_tex_coords["fts"],
+                    "texture_map_path": door_frame_texture_map_path
+                }
+            except (FileNotFoundError, IOError, OSError) as e:
+                print(f"Warning: Door frame texture not found for {door.id}: {e}", file=sys.stderr)
+                door_frame_texture_info = texture_info  # Fallback to door texture
+        else:
+            door_frame_texture_info = texture_info  # Fallback to door texture (or None)
 
         mesh_info_dict[f"{door.id}_frame"] = {
             "mesh": door_frame_mesh,
