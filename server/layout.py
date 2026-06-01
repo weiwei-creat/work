@@ -643,6 +643,8 @@ async def select_materials_for_rooms(floor_plan: FloorPlan) -> FloorPlan:
                     return texture_map_pil
 
 
+
+
                 if True:
                     floor_texture_map_pil = material_generate_from_prompt([floor_description])[0]
                     floor_texture_map_pil = ensure_visible_room_texture(floor_texture_map_pil, "floor")
