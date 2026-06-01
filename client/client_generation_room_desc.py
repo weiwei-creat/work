@@ -1350,6 +1350,13 @@ async def main():
         required=True,
         help='List of MCP server script paths (.py files)'
     )
+
+    parser.add_argument(
+        '--max_tool_calls',
+        type=int,
+        default=15,
+        help='Maximum number of MCP tool calls before stopping'
+    )
     
     args = parser.parse_args()
     
@@ -1392,6 +1399,7 @@ async def main():
             print(f"📸 Found {len(image_paths)} image(s) to include")
     
     client = MCPClientOAI()
+    client.max_tool_calls = args.max_tool_calls
     
     try:
         print(f"🔌 Connecting to {len(args.server_paths)} MCP server(s)...")
