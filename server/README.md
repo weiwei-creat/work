@@ -61,14 +61,41 @@ curl http://127.0.0.1:8080/health
 ### 1.2 启动 Isaac Sim MCP 服务端
 ```bash
 cd /home/gaok/coding/sage
-conda activate sage
+conda activate sage5080
 ./client/isaac_sim_conda.sh \
   --no-window \
   omni.isaac.sim \
   --ext-folder /home/gaok/coding/sage/server/isaacsim \
   --enable isaac.sim.mcp_extension
 ```
-启动成功后日志中应能看到：`Isaac Sim MCP server started on localhost:8766`
+启动成功后日志中应能看到 MCP 端口，例如：
+`Isaac Sim MCP server started on localhost:11323`。
+当前默认端口由 `SLURM_JOB_ID` 哈希得到；非 SLURM 环境下通常是 `11323`。以启动日志为准。
+
+确认 MCP 端口正在监听：
+```bash
+ss -ltnp | grep 11323
+```
+
+注意：直接启动 `isaacsim.exp.full.kit` 只能打开普通 Isaac Sim，不会启动 SAGE 的 MCP socket。预览图和 critic 流程必须使用上面的 `--ext-folder ... --enable isaac.sim.mcp_extension` 启动方式。
+
+### 1.2.1 Isaac 预览图验证
+预览图只允许使用 Isaac Sim/Replicator 渲染；CPU fallback 已关闭。Isaac MCP 未启动、渲染失败、生成全黑/全白图时会直接报错。
+
+手动验证某个 layout 的预览图：
+```bash
+cd /home/gaok/coding/sage
+ISAAC_MCP_PORT=11323 python server/isaaclab/layout_preview.py \
+  --layout_id layout_7c95fb4c \
+  --resolution 256
+```
+
+成功后应生成：
+```bash
+ls server/results/layout_7c95fb4c/preview/*_rendered_view_*.png
+```
+
+如果报 `ConnectionRefusedError`，先确认 MCP 端口监听和 Isaac 启动命令；如果报 invalid preview，检查 Isaac 日志中的 `render_room_preview`、`Replicator`、`BasicWriter` 相关错误。
 
 
 ### 1.3 视觉语言模型（VLM）
@@ -161,7 +188,16 @@ conda activate sage
   --ext-folder /home/gaok/coding/sage/server/isaacsim \
   --enable isaac.sim.mcp_extension
 ```
-启动成功后日志中应能看到：`Isaac Sim MCP server started on localhost:8766`
+启动成功后日志中应能看到 MCP 端口，例如：
+`Isaac Sim MCP server started on localhost:11323`。
+当前默认端口由 `SLURM_JOB_ID` 哈希得到；非 SLURM 环境下通常是 `11323`。以启动日志为准。
+
+确认 MCP 端口正在监听：
+```bash
+ss -ltnp | grep 11323
+```
+
+注意：直接启动 `isaacsim.exp.full.kit` 只能打开普通 Isaac Sim，不会启动 SAGE 的 MCP socket。预览图和 critic 流程必须使用上面的 `--ext-folder ... --enable isaac.sim.mcp_extension` 启动方式。
 
 ### 终端 3：运行 SAGE 后端 / 生成端
 低显存默认运行方式：

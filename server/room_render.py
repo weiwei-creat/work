@@ -20,6 +20,7 @@ import numpy as np
 
 _NVDIFFRAST_RENDERER = None
 _NVDIFFRAST_IMPORT_ERROR = None
+_CPU_RENDER_FALLBACK_ENABLED = False
 
 
 def _load_nvdiffrast_renderer():
@@ -74,6 +75,13 @@ def _is_nvdiffrast_cuda_failure(exc: Exception) -> bool:
         or "cuda error" in message
         or "no module named" in message
     )
+
+
+def _raise_renderer_unavailable(exc: Exception):
+    raise RuntimeError(
+        "Isaac/RTX preview rendering failed and CPU fallback is disabled. "
+        "Fix the Isaac Sim or nvdiffrast renderer instead of generating CPU fallback images."
+    ) from exc
 
 
 def _load_font(size: int, bold: bool = False):
@@ -318,65 +326,80 @@ def get_filtered_mesh_dict_list(layout: FloorPlan, room: Room, camera_pos, looka
 
 
 def render_room_four_top_view(layout: FloorPlan, room_id: str, resolution = 768):
-    import torch
+    try:
+        import torch
 
-    renderer = _load_nvdiffrast_renderer()
-    get_mesh_dict_list_from_single_room = renderer["get_mesh_dict_list_from_single_room"]
-    get_intrinsic = renderer["get_intrinsic"]
-    get_camera_perspective_projection_matrix = renderer["get_camera_perspective_projection_matrix"]
-    get_glctx = renderer["get_glctx"]
-    build_camera_matrix = renderer["build_camera_matrix"]
-    get_mvp_matrix = renderer["get_mvp_matrix"]
-    rasterize_mesh_dict_list_with_uv_efficient = renderer["rasterize_mesh_dict_list_with_uv_efficient"]
-    
-    mesh_dict_list = get_mesh_dict_list_from_single_room(layout, room_id)
-    intrinsic = get_intrinsic(80, resolution, resolution)
-    projection_matrix = get_camera_perspective_projection_matrix(
-        intrinsic[0], intrinsic[1], intrinsic[2], intrinsic[3], resolution, resolution, 0.001, 100.0)
+        renderer = _load_nvdiffrast_renderer()
+        get_mesh_dict_list_from_single_room = renderer["get_mesh_dict_list_from_single_room"]
+        get_intrinsic = renderer["get_intrinsic"]
+        get_camera_perspective_projection_matrix = renderer["get_camera_perspective_projection_matrix"]
+        get_glctx = renderer["get_glctx"]
+        build_camera_matrix = renderer["build_camera_matrix"]
+        get_mvp_matrix = renderer["get_mvp_matrix"]
+        rasterize_mesh_dict_list_with_uv_efficient = renderer["rasterize_mesh_dict_list_with_uv_efficient"]
+    except Exception as exc:
+        if _is_nvdiffrast_cuda_failure(exc):
+            if not _CPU_RENDER_FALLBACK_ENABLED:
+                _raise_renderer_unavailable(exc)
+            print(f"Warning: nvdiffrast unavailable, using CPU top-view fallback: {exc}", flush=True)
+            base = _draw_cpu_top_down(layout, room_id, resolution=resolution)
+            return [np.rot90(base, k).copy() for k in range(4)]
+        raise
 
-    glctx = get_glctx()
+    try:
+        mesh_dict_list = get_mesh_dict_list_from_single_room(layout, room_id)
+        intrinsic = get_intrinsic(80, resolution, resolution)
+        projection_matrix = get_camera_perspective_projection_matrix(
+            intrinsic[0], intrinsic[1], intrinsic[2], intrinsic[3], resolution, resolution, 0.001, 100.0)
 
-    all_rooms = layout.rooms
-    room = next(room for room in all_rooms if room.id == room_id)
+        glctx = get_glctx()
 
-    room_position = np.array([room.position.x, room.position.y, room.position.z])
-    room_height = room.dimensions.height * 1.5
-    room_width = room.dimensions.width
-    room_length = room.dimensions.length
+        all_rooms = layout.rooms
+        room = next(room for room in all_rooms if room.id == room_id)
 
-    room_top_corners = [
-        room_position + np.array([0, 0, room_height]),
-        room_position + np.array([room_width, 0, room_height]),
-        room_position + np.array([0, room_length, room_height]),
-        room_position + np.array([room_width, room_length, room_height]),
-    ]
+        room_position = np.array([room.position.x, room.position.y, room.position.z])
+        room_height = room.dimensions.height * 1.5
+        room_width = room.dimensions.width
+        room_length = room.dimensions.length
 
-    room_lookat_corners = [
-        room_position + np.array([room_width * 0.5, room_length * 0.5, 0]),
-        room_position + np.array([room_width * 0.5, room_length * 0.5, 0]),
-        room_position + np.array([room_width * 0.5, room_length * 0.5, 0]),
-        room_position + np.array([room_width * 0.5, room_length * 0.5, 0]),
-    ]
+        room_top_corners = [
+            room_position + np.array([0, 0, room_height]),
+            room_position + np.array([room_width, 0, room_height]),
+            room_position + np.array([0, room_length, room_height]),
+            room_position + np.array([room_width, room_length, room_height]),
+        ]
 
-    # for every top corner of the room, build a camera pose
-    all_rgb = []
-    for top_corner, lookat_corner in zip(room_top_corners, room_lookat_corners):
+        room_lookat_corners = [
+            room_position + np.array([room_width * 0.5, room_length * 0.5, 0]),
+            room_position + np.array([room_width * 0.5, room_length * 0.5, 0]),
+            room_position + np.array([room_width * 0.5, room_length * 0.5, 0]),
+            room_position + np.array([room_width * 0.5, room_length * 0.5, 0]),
+        ]
 
-        camera_matrix = build_camera_matrix(
-            torch.from_numpy(top_corner).float(),
-            torch.from_numpy(lookat_corner).float(),
-            torch.from_numpy(np.array([0, 0, 1])).float()
-        )
+        all_rgb = []
+        for top_corner, lookat_corner in zip(room_top_corners, room_lookat_corners):
+            camera_matrix = build_camera_matrix(
+                torch.from_numpy(top_corner).float(),
+                torch.from_numpy(lookat_corner).float(),
+                torch.from_numpy(np.array([0, 0, 1])).float()
+            )
 
-        mvp_matrix = get_mvp_matrix(camera_matrix, projection_matrix)
+            mvp_matrix = get_mvp_matrix(camera_matrix, projection_matrix)
+            valid, instance_id, rgb = rasterize_mesh_dict_list_with_uv_efficient(
+                mesh_dict_list, mvp_matrix, glctx, (resolution, resolution)
+            )
+            rgb = rgb.cpu().numpy().clip(0, 1)
+            all_rgb.append(rgb)
 
-        valid, instance_id, rgb = rasterize_mesh_dict_list_with_uv_efficient(mesh_dict_list, mvp_matrix, glctx, (resolution, resolution))
-
-        rgb = rgb.cpu().numpy().clip(0, 1)
-
-        all_rgb.append(rgb)
-
-    return all_rgb
+        return all_rgb
+    except Exception as exc:
+        if _is_nvdiffrast_cuda_failure(exc):
+            if not _CPU_RENDER_FALLBACK_ENABLED:
+                _raise_renderer_unavailable(exc)
+            print(f"Warning: nvdiffrast top-view render failed, using CPU fallback: {exc}", flush=True)
+            base = _draw_cpu_top_down(layout, room_id, resolution=resolution)
+            return [np.rot90(base, k).copy() for k in range(4)]
+        raise
 
 
 def render_room_four_edges_view(layout: FloorPlan, room_id: str, resolution = 1024):
@@ -392,6 +415,8 @@ def render_room_four_edges_view(layout: FloorPlan, room_id: str, resolution = 10
         rasterize_mesh_dict_list_with_uv_efficient = renderer["rasterize_mesh_dict_list_with_uv_efficient"]
     except Exception as exc:
         if _is_nvdiffrast_cuda_failure(exc):
+            if not _CPU_RENDER_FALLBACK_ENABLED:
+                _raise_renderer_unavailable(exc)
             print(f"Warning: nvdiffrast unavailable, using CPU room render fallback: {exc}", flush=True)
             base = _draw_cpu_top_down(layout, room_id, resolution=resolution)
             return [np.rot90(base, k).copy() for k in range(4)]
@@ -454,6 +479,8 @@ def render_room_four_edges_view(layout: FloorPlan, room_id: str, resolution = 10
         return all_rgb
     except Exception as exc:
         if _is_nvdiffrast_cuda_failure(exc):
+            if not _CPU_RENDER_FALLBACK_ENABLED:
+                _raise_renderer_unavailable(exc)
             print(f"Warning: nvdiffrast render failed, using CPU room render fallback: {exc}", flush=True)
             base = _draw_cpu_top_down(layout, room_id, resolution=resolution)
             return [np.rot90(base, k).copy() for k in range(4)]
@@ -474,6 +501,8 @@ def render_room_top_orthogonal_view(layout: FloorPlan, room_id: str, resolution 
         rasterize_mesh_dict_list_with_uv_efficient = renderer["rasterize_mesh_dict_list_with_uv_efficient"]
     except Exception as exc:
         if _is_nvdiffrast_cuda_failure(exc):
+            if not _CPU_RENDER_FALLBACK_ENABLED:
+                _raise_renderer_unavailable(exc)
             print(f"Warning: nvdiffrast unavailable, using CPU top-down fallback: {exc}", flush=True)
             return _draw_cpu_top_down(
                 layout,
@@ -528,6 +557,8 @@ def render_room_top_orthogonal_view(layout: FloorPlan, room_id: str, resolution 
         return rgb
     except Exception as exc:
         if _is_nvdiffrast_cuda_failure(exc):
+            if not _CPU_RENDER_FALLBACK_ENABLED:
+                _raise_renderer_unavailable(exc)
             print(f"Warning: nvdiffrast top-down render failed, using CPU fallback: {exc}", flush=True)
             return _draw_cpu_top_down(
                 layout,

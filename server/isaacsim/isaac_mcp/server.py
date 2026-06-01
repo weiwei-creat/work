@@ -570,6 +570,26 @@ def get_room_layout_scene_usd(scene_save_dir: str, usd_file_path: str) -> str:
         logger.error(f"Error get_room_layout_scene_usd: {str(e)}")
         return f'error: {"status": "error", "error": str(e), "message": "Error get_room_layout_scene_usd"}'
 
+def render_room_preview(scene_save_dir: str, room_id: str, resolution: int = 1024, num_views: int = 4) -> str:
+    """
+    Render preview PNGs from the active Isaac Sim stage.
+    """
+    try:
+        isaac = get_isaac_connection()
+        result = isaac.send_command(
+            "render_room_preview",
+            {
+                "scene_save_dir": scene_save_dir,
+                "room_id": room_id,
+                "resolution": resolution,
+                "num_views": num_views,
+            },
+        )
+        return result
+    except Exception as e:
+        logger.error(f"Error render_room_preview: {str(e)}")
+        return {"status": "error", "error": str(e), "message": "Error render_room_preview"}
+
 def get_room_layout_scene_usd_separate(scene_save_dir: str, usd_collection_dir: str) -> str:
     """
     Get the USD file of the room layout scene.
@@ -839,4 +859,3 @@ def transform(
     except Exception as e:
         logger.error(f"Error transforming model: {str(e)}")
         return f"Error transforming model: {str(e)}"
-

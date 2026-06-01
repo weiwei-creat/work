@@ -41,6 +41,7 @@ SOFTWARE.
 import asyncio
 import carb
 import tempfile
+import inspect
 # import omni.ext
 # import omni.ui as ui
 import omni.usd
@@ -51,7 +52,7 @@ import json
 import traceback
 import sys
 import gc
-from pxr import Gf, Usd, UsdGeom, Vt, UsdPhysics, PhysxSchema, UsdUtils, Sdf, UsdShade
+from pxr import Gf, Usd, UsdGeom, UsdLux, Vt, UsdPhysics, PhysxSchema, UsdUtils, Sdf, UsdShade
 
 import omni
 import omni.kit.commands
@@ -75,6 +76,7 @@ from isaac_sim_mcp_extension.usd_utils import (
 from isaac_sim_mcp_extension.sim_utils import (
     get_all_prims_with_paths, 
     get_all_prims_with_prim_paths,
+    quaternion_angle,
     start_simulation_and_track,
     start_simulation_and_track_groups
 )
@@ -300,6 +302,8 @@ class MCPExtension(omni.ext.IExt):
                         async def execute_wrapper():
                             try:
                                 response = self.execute_command(command)
+                                if inspect.isawaitable(response):
+                                    response = await response
                                 response_json = json.dumps(response)
                                 print("response_json: ", response_json)
                                 try:
@@ -394,6 +398,7 @@ class MCPExtension(omni.ext.IExt):
             "simulate_the_scene_groups": self.simulate_the_scene_groups,
             "create_single_room_layout_scene_from_room": self.create_single_room_layout_scene_from_room,
             "get_room_layout_scene_usd": self.get_room_layout_scene_usd,
+            "render_room_preview": self.render_room_preview,
             "simulate_the_scene": self.simulate_the_scene,
             "test_object_placements_in_single_room": self.test_object_placements_in_single_room,
             "get_room_layout_scene_usd_separate": self.get_room_layout_scene_usd_separate,
@@ -405,6 +410,8 @@ class MCPExtension(omni.ext.IExt):
             try:
                 print(f"Executing handler for {cmd_type}")
                 result = handler(**params)
+                if inspect.isawaitable(result):
+                    return result
                 print(f"Handler execution complete: /n", result)
                 # return result
                 if result and result.get("status") == "success":   
@@ -1291,6 +1298,28 @@ class MCPExtension(omni.ext.IExt):
                 "message": str(e)
             }
     
+    def _create_fresh_usd_stage(self, usd_file_path: str):
+        """Create an empty USD stage even if this path is already loaded in USD's layer registry."""
+        usd_file_path = os.path.abspath(usd_file_path)
+        os.makedirs(os.path.dirname(usd_file_path), exist_ok=True)
+
+        usdz_file_path = usd_file_path.replace(".usd", ".usdz")
+        if os.path.exists(usdz_file_path):
+            os.remove(usdz_file_path)
+
+        existing_layer = Sdf.Layer.Find(usd_file_path)
+        if existing_layer is not None:
+            existing_layer.Clear()
+            stage = Usd.Stage.Open(existing_layer)
+            if stage is None:
+                raise RuntimeError(f"Failed to reopen existing USD layer: {usd_file_path}")
+            return stage
+
+        if os.path.exists(usd_file_path):
+            os.remove(usd_file_path)
+
+        return Usd.Stage.CreateNew(usd_file_path)
+
     def get_room_layout_scene_usd(self, scene_save_dir: str, usd_file_path: str):
         """
         Create a room layout scene from a dictionary of mesh information.
@@ -1316,11 +1345,7 @@ class MCPExtension(omni.ext.IExt):
             
             mesh_info_dict = export_layout_to_mesh_dict_list(current_layout)
 
-            # remove usd_file_path if it exists
-            if os.path.exists(usd_file_path):
-                os.remove(usd_file_path)
-
-            stage = Usd.Stage.CreateNew(usd_file_path)
+            stage = self._create_fresh_usd_stage(usd_file_path)
 
             collision_approximation = "sdf"
             
@@ -1411,7 +1436,7 @@ class MCPExtension(omni.ext.IExt):
 
     def save_usd_with_ids(self, usd_file_path, mesh_info_dict, room_base_ids):
 
-        stage = Usd.Stage.CreateNew(usd_file_path)
+        stage = self._create_fresh_usd_stage(usd_file_path)
 
         collision_approximation = "sdf"
         # collision_approximation = "convexDecomposition"
@@ -1462,7 +1487,7 @@ class MCPExtension(omni.ext.IExt):
         door_id,
         door_frame_id
     ):
-        stage = Usd.Stage.CreateNew(usd_file_path)
+        stage = self._create_fresh_usd_stage(usd_file_path)
 
         world_base_prim = UsdGeom.Xform.Define(stage, "/World")
 
@@ -1686,7 +1711,7 @@ class MCPExtension(omni.ext.IExt):
                 "message": str(e)
             }
 
-    def simulate_the_scene(self):
+    async def simulate_the_scene(self):
         """
         Simulate the scene.
         """
@@ -1694,7 +1719,97 @@ class MCPExtension(omni.ext.IExt):
             stage = omni.usd.get_context().get_stage()
 
             prims, prim_paths = get_all_prims_with_paths(self.track_ids)
-            traced_data_all = start_simulation_and_track(prims, prim_paths)
+            timeline = omni.timeline.get_timeline_interface()
+            app = omni.kit.app.get_app()
+
+            if timeline.is_playing():
+                timeline.stop()
+            timeline.set_current_time(0.0)
+            await app.next_update_async()
+
+            init_data = {}
+            last_data = {}
+            final_data = {}
+            for prim_path, prim in zip(prim_paths, prims):
+                xform = UsdGeom.Xformable(prim)
+                transform = xform.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+                position = Gf.Vec3d(transform.ExtractTranslation())
+                rotation = transform.ExtractRotationQuat()
+                orientation = np.array(
+                    [rotation.GetReal(), *rotation.GetImaginary()],
+                    dtype=np.float64,
+                )
+                init_data[prim_path] = {
+                    "position": np.array([position[0], position[1], position[2]], dtype=np.float64),
+                    "orientation": orientation,
+                }
+                last_data[prim_path] = {
+                    "position": init_data[prim_path]["position"].copy(),
+                    "orientation": orientation.copy(),
+                }
+
+            timeline.play()
+
+            equilibrium_counts = {prim_path: 0 for prim_path in prim_paths}
+            stable_flags = {prim_path: True for prim_path in prim_paths}
+            simulation_steps = 2000
+            longterm_equilibrium_steps = 20
+            stable_position_limit = 0.2
+            stable_rotation_limit = 8.0
+
+            for elapsed_steps in range(1, simulation_steps + 1):
+                await app.next_update_async()
+
+                all_longterm_equilibrium = True
+                for prim_path, prim in zip(prim_paths, prims):
+                    xform = UsdGeom.Xformable(prim)
+                    transform = xform.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+                    position = Gf.Vec3d(transform.ExtractTranslation())
+                    rotation = transform.ExtractRotationQuat()
+                    current_position = np.array([position[0], position[1], position[2]], dtype=np.float64)
+                    current_orientation = np.array([rotation.GetReal(), *rotation.GetImaginary()], dtype=np.float64)
+
+                    d_position_total = float(np.linalg.norm(current_position - init_data[prim_path]["position"]))
+                    d_rotation_total = float(quaternion_angle(current_orientation, init_data[prim_path]["orientation"]))
+                    d_position_last = float(np.linalg.norm(current_position - last_data[prim_path]["position"]))
+                    d_rotation_last = float(quaternion_angle(current_orientation, last_data[prim_path]["orientation"]))
+
+                    stable_flags[prim_path] = (
+                        d_position_total <= stable_position_limit and d_rotation_total <= stable_rotation_limit
+                    )
+                    if d_position_last < 1e-3 and d_rotation_last < 1e-3:
+                        equilibrium_counts[prim_path] += 1
+                    else:
+                        equilibrium_counts[prim_path] = 0
+
+                    last_data[prim_path] = {
+                        "position": current_position.copy(),
+                        "orientation": current_orientation.copy(),
+                    }
+                    final_data[prim_path] = {
+                        "final_position": current_position,
+                        "final_orientation": current_orientation,
+                        "stable": stable_flags[prim_path],
+                        "initial_position": init_data[prim_path]["position"],
+                        "initial_orientation": init_data[prim_path]["orientation"],
+                    }
+
+                    if equilibrium_counts[prim_path] < longterm_equilibrium_steps:
+                        all_longterm_equilibrium = False
+
+                if not all(stable_flags.values()):
+                    unstable_path = next(path for path, stable in stable_flags.items() if not stable)
+                    print(f"early stop: unstable prim: {unstable_path}")
+                    break
+
+                if all_longterm_equilibrium:
+                    print("early stop: all longterm equilibrium")
+                    break
+
+                print(f"\relapsed steps: {elapsed_steps:05d}/{simulation_steps:05d}", end="")
+
+            timeline.stop()
+            traced_data_all = final_data
 
             unstable_prims = []
             unstable_object_ids = []
@@ -1724,6 +1839,11 @@ Suggestions:
 
         except Exception as e:
             print(f"Error simulating the scene: {str(e)}")
+            traceback.print_exc()
+            return {
+                "status": "error",
+                "message": str(e)
+            }
     
     def simulate_the_scene_groups(self):
         """
@@ -1771,9 +1891,159 @@ Suggestions:
             }
 
                 
+    async def render_room_preview(self, scene_save_dir: str, room_id: str, resolution: int = 1024, num_views: int = 4):
+        """
+        Render room preview images from the current Isaac Sim stage using Replicator.
+        """
+        try:
+            stage = omni.usd.get_context().get_stage()
+            if stage is None:
+                return {"status": "error", "message": "No active stage to render"}
+
+            current_layout_id = os.path.basename(scene_save_dir)
+            json_file_path = os.path.join(scene_save_dir, f"{current_layout_id}.json")
+            with open(json_file_path, "r") as f:
+                layout_data = json.load(f)
+
+            room_data = next((room for room in layout_data.get("rooms", []) if room.get("id") == room_id), None)
+            if room_data is None:
+                return {"status": "error", "message": f"Room {room_id} not found in {json_file_path}"}
+
+            preview_dir = os.path.join(scene_save_dir, "preview")
+            os.makedirs(preview_dir, exist_ok=True)
+
+            import glob
+            import shutil
+            import omni.replicator.core as rep
+
+            room_pos = room_data["position"]
+            room_dims = room_data["dimensions"]
+            room_position = np.array([room_pos["x"], room_pos["y"], room_pos["z"]], dtype=float)
+            room_width = float(room_dims["width"])
+            room_length = float(room_dims["length"])
+            room_height = float(room_dims["height"]) * 1.5
+            lookat = (
+                room_position
+                + np.array([room_width * 0.5, room_length * 0.5, float(room_dims["height"]) * 0.25], dtype=float)
+            )
+            room_center = room_position + np.array([room_width * 0.5, room_length * 0.5, 0.0], dtype=float)
+
+            self._prepare_room_preview_stage(stage, room_id, room_center, float(room_dims["height"]))
+
+            top_corners = [
+                room_position + np.array([0, 0, room_height], dtype=float),
+                room_position + np.array([room_width, 0, room_height], dtype=float),
+                room_position + np.array([0, room_length, room_height], dtype=float),
+                room_position + np.array([room_width, room_length, room_height], dtype=float),
+            ]
+            if num_views < len(top_corners):
+                top_corners = top_corners[:num_views]
+
+            rendered_paths = []
+            for i, camera_pos in enumerate(top_corners):
+                view_dir = os.path.join(preview_dir, f"_isaac_view_{i + 1}")
+                if os.path.isdir(view_dir):
+                    shutil.rmtree(view_dir)
+                os.makedirs(view_dir, exist_ok=True)
+
+                camera = rep.create.camera(
+                    position=tuple(float(v) for v in camera_pos),
+                    look_at=tuple(float(v) for v in lookat),
+                    clipping_range=(0.01, 1000000.0),
+                    focal_length=20.0,
+                    name=f"SAGEPreviewCamera_{room_id}_{i + 1}",
+                )
+                render_product = rep.create.render_product(camera, (int(resolution), int(resolution)), force_new=True)
+                writer = rep.WriterRegistry.get("BasicWriter")
+                writer.initialize(output_dir=view_dir, rgb=True, image_output_format="png", frame_padding=4)
+                writer.attach([render_product])
+
+                await rep.orchestrator.step_async(rt_subframes=16, pause_timeline=True, wait_for_render=True)
+                await rep.orchestrator.wait_until_complete_async()
+                writer.detach()
+
+                candidates = sorted(glob.glob(os.path.join(view_dir, "**", "rgb_*.png"), recursive=True))
+                if not candidates:
+                    candidates = sorted(glob.glob(os.path.join(view_dir, "**", "*.png"), recursive=True))
+                if not candidates:
+                    return {"status": "error", "message": f"Isaac render produced no PNG for view {i + 1}"}
+
+                final_path = os.path.join(preview_dir, f"{room_id}_rendered_view_{i + 1}.png")
+                shutil.copy2(candidates[-1], final_path)
+                validation_error = self._validate_preview_png(final_path)
+                if validation_error:
+                    return {
+                        "status": "error",
+                        "message": f"Isaac render produced an invalid preview for view {i + 1}: {validation_error}",
+                        "preview_path": final_path,
+                    }
+                rendered_paths.append(final_path)
+
+            return {
+                "status": "success",
+                "message": f"Rendered {len(rendered_paths)} Isaac preview images",
+                "preview_paths": rendered_paths,
+            }
+
+        except Exception as e:
+            print(f"Error rendering the room: {str(e)}")
+            traceback.print_exc()
+            return {
+                "status": "error",
+                "message": str(e)
+            }
+
+    def _prepare_room_preview_stage(self, stage, room_id: str, room_center: np.ndarray, room_height: float):
+        """Make the room visible to the preview cameras and add deterministic preview lights."""
+        for prim in stage.Traverse():
+            path = prim.GetPath().pathString
+            if path.startswith(f"/World/floor_{room_id}") and path.endswith("_ceiling"):
+                UsdGeom.Imageable(prim).MakeInvisible()
+
+        for path in [
+            "/World/SAGEPreviewDomeLight",
+            "/World/SAGEPreviewDistantLight",
+            "/World/SAGEPreviewRectLight",
+        ]:
+            if stage.GetPrimAtPath(path):
+                stage.RemovePrim(path)
+
+        dome = UsdLux.DomeLight.Define(stage, "/World/SAGEPreviewDomeLight")
+        dome.CreateIntensityAttr(650.0)
+        dome.CreateExposureAttr(0.0)
+
+        distant = UsdLux.DistantLight.Define(stage, "/World/SAGEPreviewDistantLight")
+        distant.CreateIntensityAttr(800.0)
+        distant.CreateAngleAttr(0.5)
+        distant.AddRotateXYZOp().Set(Gf.Vec3f(-55.0, 0.0, 35.0))
+
+        rect = UsdLux.RectLight.Define(stage, "/World/SAGEPreviewRectLight")
+        rect.CreateIntensityAttr(900.0)
+        rect.CreateWidthAttr(5.0)
+        rect.CreateHeightAttr(4.0)
+        rect.AddTranslateOp().Set(Gf.Vec3d(float(room_center[0]), float(room_center[1]), room_height + 1.1))
+        rect.AddRotateXYZOp().Set(Gf.Vec3f(-90.0, 0.0, 0.0))
+
+    def _validate_preview_png(self, path: str) -> Optional[str]:
+        try:
+            from PIL import Image, ImageStat
+
+            image = Image.open(path).convert("RGB")
+            extrema = ImageStat.Stat(image).extrema
+            if all(channel_min == channel_max == 0 for channel_min, channel_max in extrema):
+                return "all pixels are black"
+            if all(channel_min >= 245 and channel_max >= 245 for channel_min, channel_max in extrema):
+                return "all pixels are near white"
+            if max(channel_max - channel_min for channel_min, channel_max in extrema) < 8:
+                return "image has almost no contrast"
+            return None
+        except Exception as exc:
+            return f"could not validate PNG: {exc}"
+
     def render_room(self, room_id: str):
         try:
             stage = omni.usd.get_context().get_stage()
+            return {"status": "success", "message": f"Active stage: {stage}"}
 
         except Exception as e:
             print(f"Error rendering the room: {str(e)}")

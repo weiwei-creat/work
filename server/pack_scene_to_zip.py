@@ -15,6 +15,7 @@
 import os
 import shutil
 import glob
+import subprocess
 from constants import RESULTS_DIR
 import argparse
 import json
@@ -242,10 +243,9 @@ if __name__ == "__main__":
         json.dump(layout_dict, f, indent=4)
     print(f"Created: {layout_id}.json")
 
-    render_script_path = "render_preview.sh"
+    render_script_path = os.path.join(os.path.dirname(__file__), "render_preview.sh")
     render_script_args = f"{layout_dir}/{layout_id}.json"
-    render_cmd = f"bash {render_script_path} {render_script_args}"
-    os.system(render_cmd)
+    subprocess.run(["bash", render_script_path, render_script_args], check=True)
 
     preview_dir = os.path.join(layout_dir, "preview")
     # Copy preview directory to upload folder
