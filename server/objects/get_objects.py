@@ -25,6 +25,7 @@ from foundation_models import get_clip_models, get_sbert_model
 import sys
 import numpy as np
 from constants import RESULTS_DIR
+from key import SERVER_URL
 
 object_retriever_objaverse = None
 object_retriever_objathor_text = None
@@ -38,10 +39,20 @@ def _env_bool(name, default=False):
 
 
 def trellis_generation_enabled():
-    if "SAGE_ENABLE_TRELLIS_GENERATION" in os.environ:
-        return _env_bool("SAGE_ENABLE_TRELLIS_GENERATION")
+    # Explicit env-var overrides
     if "SAGE_DISABLE_TRELLIS" in os.environ:
         return not _env_bool("SAGE_DISABLE_TRELLIS")
+    if "SAGE_ENABLE_TRELLIS_GENERATION" in os.environ:
+        return _env_bool("SAGE_ENABLE_TRELLIS_GENERATION")
+    # Auto-detect: health-check the TRELLIS server
+    try:
+        import requests
+        r = requests.get(f"{SERVER_URL}/health", timeout=2)
+        if r.status_code == 200:
+            print("TRELLIS server detected and healthy at", SERVER_URL, file=sys.stderr)
+            return True
+    except Exception:
+        pass
     return False
 
 
@@ -195,19 +206,24 @@ def rotate_wall_mesh(mesh_dict):
 
 
 def get_object_candidates(object_info: dict, source: str = "generation"):
-    # now only support objaverse retrieval
-    if source == "generation" and not trellis_generation_enabled():
-        print("TRELLIS generation is disabled by config; using Objathor retrieval instead", file=sys.stderr)
-        source = "objaverse"
-    
-
     object_type = object_info["type"]
     object_description = object_info["description"]
     object_location = object_info["location"]
     object_size = object_info["size"]
     object_limit_size = object_info.get("limit_size", False)
-    # object_quantity = min(object_info["quantity"], 10)
-    # object_variance_type = object_info["variance_type"]
+    use_trellis = trellis_generation_enabled()
+
+    if source == "generation" and not use_trellis:
+        print("TRELLIS unavailable; using Objathor retrieval instead", file=sys.stderr)
+        source = "objaverse"
+
+    # "generation" with TRELLIS: try retrieval first, generate only if empty
+    if source == "generation" and use_trellis:
+        retrieved = get_object_candidates(object_info, source="objaverse")
+        if retrieved:
+            print(f"Retrieved {len(retrieved)} candidates from Objathor, skipping TRELLIS for '{object_type}'", file=sys.stderr)
+            return retrieved
+        print(f"No Objathor candidates for '{object_type}', generating via TRELLIS", file=sys.stderr)
     
     
     # global object_retriever_objaverse
@@ -268,6 +284,29 @@ def get_object_candidates(object_info: dict, source: str = "generation"):
                     "texture": candidate["texture"],
                     "tex_coords": candidate["tex_coords"]
                 })
+
+        return candidates
+
+    elif source == "genie_assets":
+        from .genie_retrieval import get_genie_retriever
+
+        caption = f"{object_type} {object_description}"
+        retriever = get_genie_retriever()
+        candidates_retrieved = retriever.retrieve(
+            caption,
+            max_candidates=max(3, int(object_info.get("quantity", 1)))
+        )
+
+        candidates = []
+        for asset_id, _ in candidates_retrieved:
+            obj = retriever.load_object(asset_id)
+            candidates.append({
+                "source": "genie_assets",
+                "source_id": asset_id,
+                "mesh": obj["mesh"],
+                "texture": obj["texture"],
+                "tex_coords": obj["tex_coords"],
+            })
 
         return candidates
 
@@ -352,7 +391,7 @@ def get_object_candidates(object_info: dict, source: str = "generation"):
         ]
     
     else:
-        assert False, "Only objaverse and generation are supported for now"
+        assert False, f"Unsupported object source: {source}"
 
 def get_object_mesh(source, source_id, layout_id):
     object_save_path = f"{RESULTS_DIR}/{layout_id}/{source}/{source_id}.ply"

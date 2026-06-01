@@ -86,138 +86,72 @@ def _fallback_object_attributes(caption, reference_object_size=None):
 
 class TrellisClient:
     def __init__(self, server_url=SERVER_URL):
-        self.server_url = server_url
-    
+        self.server_url = server_url.rstrip("/")
+
     def health_check(self):
-        """Check if the server is running"""
         try:
-            response = requests.get(f"{self.server_url}/health", timeout=10)
-            return response.json()
+            response = requests.get(f"{self.server_url}/api/health", timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                return data.get("ok", False) or data.get("status") == "healthy"
         except Exception as e:
-            print(f"Health check failed: {e}", file=sys.stderr)
-            return None
-    
+            print(f"TRELLIS health check failed: {e}", file=sys.stderr)
+        return False
+
     def generate_model(self, input_text, seed=1, output_file="generated_model.glb"):
-        """Generate 3D model and save GLB file using two-phase protocol with retry logic"""
-        max_retries = 3
-        
+        print(f"Generating 3D model via TRELLIS for: '{input_text}'", file=sys.stderr)
+        max_retries = 2
+
         for attempt in range(max_retries):
             if attempt > 0:
-                print(f"\n⟳ Retry attempt {attempt}/{max_retries - 1}...", file=sys.stderr)
-            
+                print(f"Retry {attempt}/{max_retries - 1}...", file=sys.stderr)
+                time.sleep(3)
+
             try:
-                print(f"Generating 3D model for: '{input_text}'", file=sys.stderr)
-                
-                # Send request
-                payload = {
-                    "input_text": input_text,
-                    "seed": seed
-                }
-
-                print("Waiting for server to be ready...", file=sys.stderr)
-
-                while True:
-                    health = self.health_check()
-                    if health:
+                # Wait for server readiness
+                for _ in range(30):
+                    if self.health_check():
                         break
-                    time.sleep(1)
-                
-                print("Server is ready. Submitting generation request...", file=sys.stderr)
-
-                # Phase 1: Submit request and get acknowledgment
-                total_trials = 0
-                job_id = None
-                
-                while True:
-                    try:
-                        response = requests.post(
-                            f"{self.server_url}/generate",
-                            json=payload,
-                            timeout=10  # Shorter timeout for acknowledgment
-                        )
-                        
-                        if response.status_code == 202:
-                            # Request acknowledged
-                            ack_data = response.json()
-                            job_id = ack_data.get('job_id')
-                            print(f"✓ Request acknowledged. Job ID: {job_id}", file=sys.stderr)
-                            print(f"Message: {ack_data.get('message', 'Processing started')}", file=sys.stderr)
-                            break
-                        else:
-                            print(f"Server returned unexpected status: {response.status_code}", file=sys.stderr)
-                            print(response.text, file=sys.stderr)
-
-                    except Exception as e:
-                        print(f"Error submitting request: {e}", file=sys.stderr)
-
-                    total_trials += 1
-                    if total_trials > 10:
-                        raise Exception("Failed to submit request after 10 trials.")
-                    
                     time.sleep(2)
-                
-                if not job_id:
-                    raise Exception("Failed to get job ID from server.")
-                
-                # Phase 2: Poll for completion
-                print(f"Waiting for generation to complete (Job ID: {job_id}, this may take several minutes)...", file=sys.stderr)
-                poll_count = 0
-                max_polls = 200  # 200 seconds max
-                
-                while poll_count < max_polls:
-                    try:
-                        if poll_count > 0 and poll_count % 10 == 0:
-                            status_response = requests.get(
-                                f"{self.server_url}/job/{job_id}",
-                                timeout=10
-                            )
-                            
-                            if status_response.status_code == 200:
-                                # Job completed successfully
-                                print("✓ Generation completed successfully!", file=sys.stderr)
-                                with open(output_file, 'wb') as f:
-                                    f.write(status_response.content)
-                                # print(f"Model saved to: {output_file}", file=sys.stderr)
-                                return True
-                            
-                            elif status_response.status_code == 202:
-                                # Still processing
-                                status_data = status_response.json()
-                                if poll_count % 10 == 0:  # Print status every 10 polls
-                                    print(f"  Status: {status_data.get('status', 'processing')}... (poll {poll_count})", file=sys.stderr)
-                            
-                            elif status_response.status_code == 500:
-                                # Job failed
-                                error_data = status_response.json()
-                                print(f"✗ Generation failed: {error_data.get('error', 'Unknown error')}", file=sys.stderr)
-                                # Don't return False here, let it retry
-                                break
-                            
-                            elif status_response.status_code == 404:
-                                print(f"✗ Job not found on server", file=sys.stderr)
-                                # Don't return False here, let it retry
-                                break
-                        else:
-                            time.sleep(1)
-                        
-                    except Exception as e:
-                        if poll_count % 10 == 0:
-                            print(f"  Polling error (will retry): {e}", file=sys.stderr)
-                    
-                    poll_count += 1
-                    time.sleep(1)  # Poll every 1 second
-                
-                # Timeout
-                if poll_count >= max_polls:
-                    print(f"✗ Timeout: Generation did not complete within {max_polls} seconds", file=sys.stderr)
-                    # Don't return False here, let it retry
-                    
+                else:
+                    print("TRELLIS server not ready after waiting", file=sys.stderr)
+                    continue
+
+                # Submit synchronous generation request (form-encoded)
+                resp = requests.post(
+                    f"{self.server_url}/api/text-to-3d",
+                    data={"prompt": input_text},
+                    timeout=300,
+                )
+                if resp.status_code != 200:
+                    print(f"TRELLIS generation returned {resp.status_code}: {resp.text[:200]}", file=sys.stderr)
+                    continue
+
+                result = resp.json()
+                if not result.get("ok"):
+                    print(f"TRELLIS generation failed: {result}", file=sys.stderr)
+                    continue
+
+                download_url = result.get("download_url")
+                if not download_url:
+                    print("No download URL in TRELLIS response", file=sys.stderr)
+                    continue
+
+                # Download the generated GLB
+                dl = requests.get(download_url, timeout=60)
+                if dl.status_code != 200:
+                    print(f"Download failed: {dl.status_code}", file=sys.stderr)
+                    continue
+
+                with open(output_file, "wb") as f:
+                    f.write(dl.content)
+                print(f"TRELLIS model saved to {output_file} ({len(dl.content)} bytes)", file=sys.stderr)
+                return True
+
             except Exception as e:
-                print(f"Generation failed: {e}", file=sys.stderr)
-                # Continue to next retry attempt
-        
-        # All retries exhausted
-        print(f"✗ Failed after {max_retries} attempts", file=sys.stderr)
+                print(f"TRELLIS generation error: {e}", file=sys.stderr)
+
+        print("TRELLIS generation failed after all retries", file=sys.stderr)
         return False
   
 def merge_vertices(mesh_dict):

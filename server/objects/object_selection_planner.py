@@ -127,19 +127,19 @@ def process_single_object(object_name: str, object_info: dict, room: Room, objec
     # Filter candidates by room dimensions
     room_dims = room.dimensions
 
-    if selection_source in {"objaverse", "objathor"}:
+    if selection_source in {"objaverse", "objathor", "genie_assets"}:
         filtered_candidates = []
-        
+
         for candidate in candidates:
             mesh = candidate["mesh"]
             # Get mesh bounding box dimensions
             bounds = mesh.bounds  # [[min_x, min_y, min_z], [max_x, max_y, max_z]]
             mesh_dims = bounds[1] - bounds[0]  # [width, length, height] in meters
-            
+
             # Check if object fits in room (with some margin for placement flexibility)
             # margin = 0.1
-            # if (mesh_dims[0] <= room_dims.width - margin and 
-            #     mesh_dims[1] <= room_dims.length - margin and 
+            # if (mesh_dims[0] <= room_dims.width - margin and
+            #     mesh_dims[1] <= room_dims.length - margin and
             #     mesh_dims[2] <= room_dims.height * 0.9):
             #     filtered_candidates.append(candidate)
 
@@ -150,7 +150,7 @@ def process_single_object(object_name: str, object_info: dict, room: Room, objec
         # replicate the candidates to make sure the quantity is enough
         filtered_candidates = candidates * object_quantity
     else:
-        assert False, "Only objaverse and generation are supported for now"
+        assert False, f"Unsupported selection source: {selection_source}"
 
     # then filter the candidates by the object sizes of candidates, choose the most similar sizes to the object_size (object_info["size"], which is a list of three numbers [length, width, height] in centimeters) in object_info
     
@@ -225,16 +225,18 @@ def process_single_object(object_name: str, object_info: dict, room: Room, objec
             mesh.export(save_path)
 
             texture = candidate["texture"]
-            texture_save_path = os.path.join(object_save_dir, f"{obj.source}", f"{obj.source_id}_texture.png")
-            if not os.path.exists(texture_save_path):
-                Image.fromarray((texture * 255).astype(np.uint8)).save(texture_save_path)
-            
+            if texture is not None:
+                texture_save_path = os.path.join(object_save_dir, f"{obj.source}", f"{obj.source_id}_texture.png")
+                if not os.path.exists(texture_save_path):
+                    Image.fromarray((texture * 255).astype(np.uint8)).save(texture_save_path)
+
             tex_coords = candidate["tex_coords"]
-            tex_coords_save_path = os.path.join(object_save_dir, f"{obj.source}", f"{obj.source_id}_tex_coords.pkl")
-            if not os.path.exists(tex_coords_save_path):
-                with open(tex_coords_save_path, 'wb') as f:    
-                    pickle.dump(tex_coords, f)
-            
+            if tex_coords is not None:
+                tex_coords_save_path = os.path.join(object_save_dir, f"{obj.source}", f"{obj.source_id}_tex_coords.pkl")
+                if not os.path.exists(tex_coords_save_path):
+                    with open(tex_coords_save_path, 'wb') as f:
+                        pickle.dump(tex_coords, f)
+
             if "pbr_parameters" in candidate:
                 pbr_parameters = candidate["pbr_parameters"]
                 pbr_parameters_save_path = os.path.join(object_save_dir, f"{obj.source}", f"{obj.source_id}_pbr_parameters.json")
@@ -242,14 +244,16 @@ def process_single_object(object_name: str, object_info: dict, room: Room, objec
                     with open(pbr_parameters_save_path, 'w') as f:
                         json.dump(pbr_parameters, f)
 
-            save_obj(
-                os.path.join(object_save_dir, f"{obj.source}", f"{obj.source_id}.obj"),
-                torch.from_numpy(candidate["mesh"].vertices),
-                torch.from_numpy(candidate["mesh"].faces),
-                verts_uvs=torch.from_numpy(candidate["tex_coords"]["vts"]),
-                faces_uvs=torch.from_numpy(candidate["tex_coords"]["fts"]),
-                texture_map=torch.from_numpy(candidate["texture"])
-            )
+            # Save OBJ only if tex_coords and texture are available
+            if tex_coords is not None and texture is not None:
+                save_obj(
+                    os.path.join(object_save_dir, f"{obj.source}", f"{obj.source_id}.obj"),
+                    torch.from_numpy(candidate["mesh"].vertices),
+                    torch.from_numpy(candidate["mesh"].faces),
+                    verts_uvs=torch.from_numpy(candidate["tex_coords"]["vts"]),
+                    faces_uvs=torch.from_numpy(candidate["tex_coords"]["fts"]),
+                    texture_map=torch.from_numpy(candidate["texture"])
+                )
     
     return selected_objects, updated_recommendations
 
