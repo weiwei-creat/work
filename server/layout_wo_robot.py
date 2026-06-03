@@ -85,7 +85,9 @@ from isaacsim.isaac_mcp.server import (
     create_physics_scene,
     get_room_layout_scene_usd,
     create_single_room_layout_scene,
-    get_room_layout_scene_usd_separate_from_layout
+    create_single_room_layout_scene_from_room,
+    get_room_layout_scene_usd_separate_from_layout,
+    render_room_preview,
 )
 import copy
 from floor_plan_materials.room_material import MaterialSelector
@@ -125,6 +127,62 @@ _critic_score_history: Dict[str, List[int]] = {}
 
 # Initialize FastMCP server
 mcp = FastMCP(f"layout_{os.environ.get('SLURM_JOB_ID')}")
+
+
+def _env_flag(name: str, default: bool = True) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() not in {"0", "false", "no", "off"}
+
+
+def _read_png_as_base64(path: str) -> str:
+    import base64
+
+    with open(path, "rb") as image_file:
+        return base64.b64encode(image_file.read()).decode("utf-8")
+
+
+def _prepare_isaac_rendered_views_for_vlm(
+    room_id: str,
+    vis_dir: str,
+    resolution: Optional[int] = None,
+    num_views: Optional[int] = None,
+) -> List[str]:
+    if current_layout is None:
+        raise RuntimeError("No active layout for Isaac preview rendering")
+
+    scene_save_dir = str(Path(RESULTS_DIR) / current_layout.id)
+    preview_dir = os.path.join(scene_save_dir, "preview")
+    requested_views = num_views or int(os.environ.get("SAGE_PREVIEW_VIEWS", "4"))
+    preview_resolution = resolution or int(os.environ.get("SAGE_PREVIEW_RESOLUTION", "512"))
+
+    pattern = os.path.join(preview_dir, f"{room_id}_rendered_view_*.png")
+    preview_paths = sorted(glob.glob(pattern))
+    if len(preview_paths) < requested_views:
+        preview_result = render_room_preview(
+            scene_save_dir,
+            room_id,
+            resolution=preview_resolution,
+            num_views=requested_views,
+        )
+        if not isinstance(preview_result, dict) or preview_result.get("status") != "success":
+            raise RuntimeError(f"Isaac preview render failed: {preview_result}")
+        preview_paths = sorted(glob.glob(pattern))
+
+    if not preview_paths:
+        raise RuntimeError(f"No Isaac preview images found for room {room_id} in {preview_dir}")
+
+    os.makedirs(vis_dir, exist_ok=True)
+    copied_paths: List[str] = []
+    for i, preview_path in enumerate(preview_paths[:requested_views], start=1):
+        vis_path = os.path.join(vis_dir, f"{room_id}_rendered_view_{i}.png")
+        shutil.copy2(preview_path, vis_path)
+        copied_paths.append(vis_path)
+
+    print(f"Isaac VLM render views saved to vis: {copied_paths}", file=sys.stderr)
+    return copied_paths
+
 
 # get room calls description
 def get_room_num_calls_description(room_num_calls: Dict) -> str:
@@ -3439,29 +3497,14 @@ async def room_semantic_critic(
 
     
     try:
-        # Import the rendering function and visualizer
-        from room_render import render_room_four_top_view, render_room_four_edges_view, render_room_top_orthogonal_view
-        from visualizer import RoomVisualizer
-        import base64
-        import io
-        import tempfile
+        from room_render import render_room_four_edges_view, render_room_top_orthogonal_view
         from PIL import Image as PILImage
-        
-        # Step 1: Render the room from four top views
-        try:
-            all_rgb = render_room_four_edges_view(current_layout, room_id, resolution=1920)
-        except Exception as e:
-            return json.dumps({
-                "success": False,
-                "error": f"Failed to render room views: {str(e)}",
-                "room_id": room_id
-            })
-        
-        # Create vis directory for debugging
+
+        # Create vis directory for VLM/debug images.
         vis_dir = f"{SERVER_ROOT_DIR}/vis"
         os.makedirs(vis_dir, exist_ok=True)
 
-        # Step 1.5: Generate annotated top-down orthogonal view
+        # Step 1: Generate annotated top-down orthogonal view for object IDs and directions.
         try:
             top_down_rgb = render_room_top_orthogonal_view(current_layout, room_id, resolution=1024)
             top_down_rgb = np.clip(top_down_rgb * 255, 0, 255).astype(np.uint8)
@@ -3473,10 +3516,7 @@ async def room_semantic_critic(
             top_down_debug_path = os.path.join(vis_dir, f"{room_id}_top_down_annotated.png")
             PILImage.fromarray(top_down_rgb).save(top_down_debug_path)
             
-            # Convert to base64
-            buffer = io.BytesIO()
-            PILImage.fromarray(top_down_rgb).save(buffer, format='PNG')
-            top_down_image_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+            top_down_image_base64 = _read_png_as_base64(top_down_debug_path)
             
             print(f"✅ Annotated top-down view created: {top_down_debug_path}", file=sys.stderr)
             
@@ -3490,30 +3530,49 @@ async def room_semantic_critic(
         # Convert RGB arrays to base64 encoded images for Claude and save for debugging
         image_data_list = []
         saved_image_paths = [top_down_debug_path]
-        
-        for i, rgb_array in enumerate(all_rgb):
+
+        perspective_image_source = "Isaac Sim/Replicator"
+        try:
+            if not _env_flag("SAGE_USE_ISAAC_RENDER_FOR_VLM", True):
+                raise RuntimeError("SAGE_USE_ISAAC_RENDER_FOR_VLM disabled")
+
+            isaac_render_paths = _prepare_isaac_rendered_views_for_vlm(room_id, vis_dir)
+            saved_image_paths.extend(isaac_render_paths)
+            image_data_list.extend(_read_png_as_base64(path) for path in isaac_render_paths)
+        except Exception as isaac_error:
+            print(f"Isaac VLM renders unavailable: {isaac_error}", file=sys.stderr)
+            if _env_flag("SAGE_REQUIRE_ISAAC_VLM_RENDERS", True):
+                return json.dumps({
+                    "success": False,
+                    "error": f"Failed to prepare Isaac Sim rendered views for VLM: {isaac_error}",
+                    "room_id": room_id
+                })
+            perspective_image_source = "software fallback renderer"
             try:
-                # Convert RGB array to PIL Image (assuming rgb_array is in [0,1] range)
-                rgb_uint8 = (rgb_array * 255).astype(np.uint8)
-                pil_image = PILImage.fromarray(rgb_uint8, 'RGB')
-                
-                # Save rendered view for debugging
-                debug_path = os.path.join(vis_dir, f"{room_id}_rendered_view_{i+1}.png")
-                pil_image.save(debug_path)
-                saved_image_paths.append(debug_path)
-                
-                # Convert to base64
-                buffer = io.BytesIO()
-                pil_image.save(buffer, format='PNG')
-                image_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
-                image_data_list.append(image_base64)
-                
+                all_rgb = render_room_four_edges_view(current_layout, room_id, resolution=1920)
             except Exception as e:
                 return json.dumps({
                     "success": False,
-                    "error": f"Failed to process rendered view {i}: {str(e)}",
+                    "error": f"Failed to render fallback room views: {str(e)}",
                     "room_id": room_id
                 })
+
+            for i, rgb_array in enumerate(all_rgb):
+                try:
+                    rgb_uint8 = (rgb_array * 255).astype(np.uint8)
+                    pil_image = PILImage.fromarray(rgb_uint8, 'RGB')
+
+                    debug_path = os.path.join(vis_dir, f"{room_id}_rendered_view_{i+1}.png")
+                    pil_image.save(debug_path)
+                    saved_image_paths.append(debug_path)
+
+                    image_data_list.append(_read_png_as_base64(debug_path))
+                except Exception as e:
+                    return json.dumps({
+                        "success": False,
+                        "error": f"Failed to process fallback rendered view {i}: {str(e)}",
+                        "room_id": room_id
+                    })
         
         # Step 2: Prepare room information for Claude
         room_description = get_room_description(room)
@@ -3552,8 +3611,8 @@ This describes the current object placement action being performed. Consider thi
 IMAGES PROVIDED:
 1. First image: Annotated top-down orthogonal view with object bounding boxes (blue), facing directions (yellow arrows), and coordinate axes
 
-2. Next 4 images: Four perspective rendered views from different angles
-   - Use these for visual realism, aesthetics, and overall room atmosphere assessment
+2. Next images: Four perspective rendered views from different angles generated by {perspective_image_source}
+   - Use these rendered images for visual realism, aesthetics, material appearance, lighting, object visibility, and overall room atmosphere assessment
 
 {user_demand_section}
 
@@ -3787,6 +3846,8 @@ At most 1-2 object adjustment analysis recommendations.
             "room_type": room.room_type,
             "room_rating": room_rating,
             "analysis_reasoning": analysis_summary.get("detailed_reasoning", "")[:800],
+            "vlm_image_source": perspective_image_source,
+            "vlm_image_paths": saved_image_paths,
             "notice": notice,
             "next_step": {
                 "actions": []  # Modification actions first, then addition actions
@@ -4037,9 +4098,13 @@ async def room_physics_critic(room_id: str):
     # export the layout to json
     export_layout_to_json(current_layout, os.path.join(output_path, f"{current_layout.id}.json"))
     
-    result = create_single_room_layout_scene(output_path, room_id)
+    room_dict_save_path = os.path.join(output_path, f"{room_id}.json")
+    with open(room_dict_save_path, "w") as f:
+        json.dump(asdict(target_room), f)
+
+    result = create_single_room_layout_scene_from_room(output_path, room_dict_save_path)
     if result['status'] != 'success':
-        return result
+        return json.dumps(result)
 
     # Export USD file for interactive preview in Isaac Sim
     usd_path = os.path.join(output_path, f"{room_id}.usd")
@@ -4050,6 +4115,38 @@ async def room_physics_critic(room_id: str):
         print(f"USD export failed (non-fatal): {e}", file=sys.stderr)
 
     result = simulate_the_scene()
+    if isinstance(result, dict) and result.get("status") == "success":
+        render_preview_enabled = _env_flag("SAGE_RENDER_PREVIEW", True)
+        if render_preview_enabled:
+            try:
+                preview_resolution = int(os.environ.get("SAGE_PREVIEW_RESOLUTION", "512"))
+                preview_views = int(os.environ.get("SAGE_PREVIEW_VIEWS", "4"))
+                preview_result = render_room_preview(
+                    output_path,
+                    room_id,
+                    resolution=preview_resolution,
+                    num_views=preview_views,
+                )
+                if isinstance(preview_result, dict) and preview_result.get("status") == "success":
+                    preview_paths = preview_result.get("preview_paths", [])
+                    result["preview_paths"] = preview_paths
+                    print(f"Isaac preview rendered: {preview_paths}", file=sys.stderr)
+                else:
+                    print(f"Isaac preview render failed: {preview_result}", file=sys.stderr)
+                    if _env_flag("SAGE_REQUIRE_ISAAC_PREVIEW", True):
+                        return json.dumps({
+                            "status": "error",
+                            "message": "Isaac preview render failed",
+                            "preview_result": preview_result,
+                        })
+            except Exception as e:
+                print(f"Isaac preview render failed: {e}", file=sys.stderr)
+                if _env_flag("SAGE_REQUIRE_ISAAC_PREVIEW", True):
+                    return json.dumps({
+                        "status": "error",
+                        "message": f"Isaac preview render failed: {e}",
+                    })
+
     # get the result dict to json string
     result = json.dumps(result)
     return result

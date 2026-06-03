@@ -176,8 +176,13 @@ class IsaacConnection:
             if response.get("status") == "error":
                 logger.error(f"Isaac error: {response.get('message')}")
                 raise Exception(response.get("message", "Unknown error from Isaac"))
-            
-            return response.get("result", {})
+
+            # Synchronous extension handlers return {"status": "success", "result": ...},
+            # while async handlers such as simulate_the_scene currently return the result
+            # payload directly as {"status": "success", ...}. Preserve both shapes.
+            if "result" in response:
+                return response["result"]
+            return response
         except socket.timeout:
             logger.error("Socket timeout while waiting for response from Isaac")
             # Don't try to reconnect here - let the get_isaac_connection handle reconnection
@@ -271,6 +276,11 @@ def slurm_job_id_to_port(job_id, port_start=8080, port_end=40000):
 
 
 def get_port():
+    override = os.environ.get("SAGE_ISAAC_MCP_PORT") or os.environ.get("ISAAC_MCP_PORT")
+    if override:
+        port = int(override)
+        print(f"Isaacsim MCP server port: {port}", file=sys.stderr)
+        return port
     slurm_job_id = os.environ.get("SLURM_JOB_ID")
     port = slurm_job_id_to_port(slurm_job_id)
     print(f"Isaacsim MCP server port: {port}", file=sys.stderr)

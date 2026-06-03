@@ -7,7 +7,7 @@ export LIBRARY_PATH=$CONDA_PREFIX/lib:$LIBRARY_PATH
 export CPATH=$CONDA_PREFIX/include:$CPATH
 export PKG_CONFIG_PATH=$CONDA_PREFIX/lib/pkgconfig:$PKG_CONFIG_PATH
 
-while true; do echo "Starting at $(date)..."; ./client/isaac_sim_conda.sh --no-window omni.isaac.sim --enable isaac.sim.mcp_extension; echo "Crashed at $(date), restarting..."; done &
+while true; do echo "Starting at $(date)..."; ./client/isaac_sim_conda.sh --no-window --experience isaacsim.exp.base.kit --enable isaac.sim.mcp_extension; echo "Crashed at $(date), restarting..."; done &
 cd ./client
 
 python client_generation.py \

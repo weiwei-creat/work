@@ -216,6 +216,9 @@ def convert_mesh_to_usd(stage, usd_internal_path, verts, faces, collision_approx
         convexdecomp = PhysxSchema.PhysxConvexDecompositionCollisionAPI.Apply(prim)
         collider = UsdPhysics.MeshCollisionAPI.Apply(prim)
         collider.CreateApproximationAttr("convexDecomposition")
+    elif collision_approximation == "convexHull":
+        collider = UsdPhysics.MeshCollisionAPI.Apply(prim)
+        collider.CreateApproximationAttr("convexHull")
 
     mat = UsdPhysics.MaterialAPI.Apply(prim)
     mat.CreateDynamicFrictionAttr(1e20)
@@ -596,10 +599,8 @@ def door_frame_to_usd(
     # ps_collision_api.CreateRestOffsetAttr(0.001)
     # ps_collision_api.CreateTorsionalPatchRadiusAttr(0.01)
 
-    physx_sdf = PhysxSchema.PhysxSDFMeshCollisionAPI.Apply(door_prim)
-    physx_sdf.CreateSdfResolutionAttr(256)
     collider = UsdPhysics.MeshCollisionAPI.Apply(door_prim)
-    collider.CreateApproximationAttr("sdf")
+    collider.CreateApproximationAttr("convexHull")
     
     # Apply physics material to door
     door_mat = UsdPhysics.MaterialAPI.Apply(door_prim)

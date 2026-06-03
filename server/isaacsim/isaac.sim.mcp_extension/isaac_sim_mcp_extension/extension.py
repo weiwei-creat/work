@@ -48,6 +48,8 @@ import omni.usd
 import threading
 import time
 import socket
+import errno
+import queue
 import json
 import traceback
 import sys
@@ -129,6 +131,10 @@ except ModuleNotFoundError:
 from scipy.spatial.transform import Rotation as R
 
 import sys
+DEFAULT_COLLISION_APPROXIMATION = os.environ.get(
+    "SAGE_COLLISION_APPROXIMATION",
+    "convexDecomposition",
+)
 # print(os.path.dirname(os.path.abspath(__file__)))
 # print(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 isaac_ext_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -159,6 +165,9 @@ class MCPExtension(omni.ext.IExt):
         self._window = None
         self._status_label = None
         self._server_thread = None
+        self._command_queue = queue.Queue()
+        self._command_subscription = None
+        self._command_processing = False
         self._models = None
         self._settings = carb.settings.get_settings()
         self._image_url_cache = {} # cache for image url
@@ -166,6 +175,9 @@ class MCPExtension(omni.ext.IExt):
         self.track_ids = []
 
     def get_port(self):
+        override = os.environ.get("SAGE_ISAAC_MCP_PORT") or os.environ.get("ISAAC_MCP_PORT")
+        if override:
+            return int(override)
         slurm_job_id = os.environ.get("SLURM_JOB_ID")
         port = slurm_job_id_to_port(slurm_job_id)
         return port
@@ -181,6 +193,11 @@ class MCPExtension(omni.ext.IExt):
 
         self.ext_id = ext_id
         self._usd_context = omni.usd.get_context()
+        self._command_subscription = (
+            omni.kit.app.get_app()
+            .get_update_event_stream()
+            .create_subscription_to_pop(self._process_command_queue, name="SAGE Isaac MCP command queue")
+        )
         # omni.kit.commands.execute("CreatePrim", prim_type="Sphere")
 
         # print("sphere created")
@@ -193,6 +210,7 @@ class MCPExtension(omni.ext.IExt):
     def on_shutdown(self):
         print("trigger  on_shutdown for: ", self.ext_id)
         self._models = {}
+        self._command_subscription = None
         gc.collect()
         self._stop()
     
@@ -218,7 +236,14 @@ class MCPExtension(omni.ext.IExt):
             print(f"Isaac Sim MCP server started on {self.host}:{self.port}")
         except Exception as e:
             print(f"Failed to start server: {str(e)}")
-            self.stop()
+            if isinstance(e, OSError) and e.errno == errno.EADDRINUSE:
+                print(
+                    f"Port {self.host}:{self.port} is already in use. "
+                    "Stop the existing Isaac MCP process or set ISAAC_MCP_PORT/SAGE_ISAAC_MCP_PORT to a free port.",
+                    file=sys.stderr,
+                )
+            self._stop()
+            raise
             
     def _stop(self):
         self.running = False
@@ -298,49 +323,13 @@ class MCPExtension(omni.ext.IExt):
                         command = json.loads(buffer.decode('utf-8'))
                         buffer = b''
                         
-                        # Execute command in Isaac Sim's main thread
-                        async def execute_wrapper():
-                            try:
-                                response = self.execute_command(command)
-                                if inspect.isawaitable(response):
-                                    response = await response
-                                response_json = json.dumps(response)
-                                print("response_json: ", response_json)
-                                try:
-                                    client.sendall(response_json.encode('utf-8'))
-                                except:
-                                    print("Failed to send response - client disconnected")
-                            except Exception as e:
-                                print(f"Error executing command: {str(e)}")
-                                traceback.print_exc()
-                                try:
-                                    error_response = {
-                                        "status": "error",
-                                        "message": str(e)
-                                    }
-                                    client.sendall(json.dumps(error_response).encode('utf-8'))
-                                except:
-                                    pass
-                            return None
-                        # import omni.kit.commands
-                        # import omni.kit.async
-                        from omni.kit.async_engine import run_coroutine
-                        task = run_coroutine(execute_wrapper())
-                        # import asyncio
-                        # asyncio.ensure_future(execute_wrapper())
-                        #time.sleep(30)
-                        
-    
-                        # 
-                        # omni.kit.async.get_event_loop().create_task(create_sphere_async())
-                        # TODO:Schedule execution in main thread
-                        # bpy.app.timers.register(execute_wrapper, first_interval=0.0)
-                        # omni.kit.app.get_app().post_to_main_thread(execute_wrapper())
-                        # carb.apputils.get_app().get_update_event_loop().post(execute_wrapper)
-
-                        # from omni.kit.async_engine import run_coroutine
-                        # run_coroutine(execute_wrapper())
-                        # omni.kit.app.get_app().get_update_event_stream().push(0, 0, {"fn": execute_wrapper})
+                        response = self._submit_command(command)
+                        response_json = json.dumps(response)
+                        print("response_json: ", response_json)
+                        try:
+                            client.sendall(response_json.encode('utf-8'))
+                        except:
+                            print("Failed to send response - client disconnected")
                     except json.JSONDecodeError:
                         # Incomplete data, wait for more
                         pass
@@ -355,6 +344,60 @@ class MCPExtension(omni.ext.IExt):
             except:
                 pass
             print("Client handler stopped")
+
+    def _submit_command(self, command):
+        request = {
+            "command": command,
+            "event": threading.Event(),
+            "response": None,
+        }
+        self._command_queue.put(request)
+        while self.running and not request["event"].wait(timeout=0.5):
+            pass
+        if not request["event"].is_set():
+            return {"status": "error", "message": "Isaac MCP server stopped before command completed"}
+        return request["response"]
+
+    def _process_command_queue(self, event=None):
+        if self._command_processing:
+            return
+        try:
+            request = self._command_queue.get_nowait()
+        except queue.Empty:
+            return
+
+        self._command_processing = True
+        async_scheduled = False
+        try:
+            response = self.execute_command(request["command"])
+            if inspect.isawaitable(response):
+                from omni.kit.async_engine import run_coroutine
+                run_coroutine(self._finish_async_command(response, request))
+                async_scheduled = True
+                return
+            self._complete_command_request(request, response)
+        except Exception as e:
+            print(f"Error executing command: {str(e)}")
+            traceback.print_exc()
+            self._complete_command_request(request, {"status": "error", "message": str(e)})
+        finally:
+            if not async_scheduled:
+                self._command_processing = False
+
+    async def _finish_async_command(self, awaitable, request):
+        try:
+            response = await awaitable
+            self._complete_command_request(request, response)
+        except Exception as e:
+            print(f"Error executing async command: {str(e)}")
+            traceback.print_exc()
+            self._complete_command_request(request, {"status": "error", "message": str(e)})
+        finally:
+            self._command_processing = False
+
+    def _complete_command_request(self, request, response):
+        request["response"] = response
+        request["event"].set()
 
     # TODO: This is a temporary function to execute commands in the main thread
     def execute_command(self, command):
@@ -600,7 +643,7 @@ class MCPExtension(omni.ext.IExt):
             # set default prim to World
             stage.SetDefaultPrim(stage.GetPrimAtPath("/World"))
 
-            collision_approximation = "sdf"
+            collision_approximation = DEFAULT_COLLISION_APPROXIMATION
             
             self.track_ids = []
             door_ids = []
@@ -667,10 +710,12 @@ class MCPExtension(omni.ext.IExt):
             # Set the world axis of the stage root layer to Z
             UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
 
+            usd_file_path = self._export_stage_snapshot(stage, scene_save_dir, room_id)
 
             return {
                 "status": "success",
                 "message": f"Room layout scene created successfully",
+                "usd_file_path": usd_file_path,
             }
 
         except Exception as e:
@@ -714,7 +759,7 @@ class MCPExtension(omni.ext.IExt):
             # set default prim to World
             stage.SetDefaultPrim(stage.GetPrimAtPath("/World"))
 
-            collision_approximation = "sdf"
+            collision_approximation = DEFAULT_COLLISION_APPROXIMATION
             
             self.track_ids = []
             door_ids = []
@@ -784,10 +829,12 @@ class MCPExtension(omni.ext.IExt):
             # Set the world axis of the stage root layer to Z
             UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
 
+            usd_file_path = self._export_stage_snapshot(stage, scene_save_dir, room_id)
 
             return {
                 "status": "success",
                 "message": f"Room layout scene created successfully",
+                "usd_file_path": usd_file_path,
             }
 
         except Exception as e:
@@ -830,7 +877,7 @@ class MCPExtension(omni.ext.IExt):
             # set default prim to World
             stage.SetDefaultPrim(stage.GetPrimAtPath("/World"))
 
-            collision_approximation = "sdf"
+            collision_approximation = DEFAULT_COLLISION_APPROXIMATION
             
             self.track_ids = []
 
@@ -897,10 +944,13 @@ class MCPExtension(omni.ext.IExt):
             # Set the world axis of the stage root layer to Z
             UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
 
+            room_usd_name = getattr(room, "id", None) or os.path.splitext(os.path.basename(room_dict_save_path))[0]
+            usd_file_path = self._export_stage_snapshot(stage, scene_save_dir, room_usd_name)
 
             return {
                 "status": "success",
                 "message": f"Room layout scene created successfully",
+                "usd_file_path": usd_file_path,
             }
 
         except Exception as e:
@@ -963,7 +1013,7 @@ class MCPExtension(omni.ext.IExt):
             # set default prim to World
             stage.SetDefaultPrim(stage.GetPrimAtPath("/World"))
 
-            collision_approximation = "sdf"
+            collision_approximation = DEFAULT_COLLISION_APPROXIMATION
             
             self.group_track_prims = {}
             self.group_ids = []
@@ -1044,74 +1094,8 @@ class MCPExtension(omni.ext.IExt):
             scene_save_dir = os.path.dirname(room_dict_save_path)
             layout_id = os.path.basename(scene_save_dir)
             
-            mesh_info_dict = export_single_room_layout_to_mesh_dict_list_from_room(target_room, layout_id)
-
-            stage = Usd.Stage.CreateInMemory()
-
-
-            world_base_prim = UsdGeom.Xform.Define(stage, "/World")
-
-            # set default prim to World
-            stage.SetDefaultPrim(stage.GetPrimAtPath("/World"))
-
-            collision_approximation = "sdf"
-            
-            track_ids = []
-            door_ids = []
-            door_frame_ids = []
-
-            for mesh_id in mesh_info_dict:
-                if mesh_id.startswith("wall_room_") or mesh_id.startswith("window_") or mesh_id.startswith("floor_"):
-                    usd_internal_path = f"/World/{mesh_id}"
-                elif mesh_id.startswith("door_"):
-                    if mesh_id.endswith("_frame"):
-                        door_frame_ids.append(mesh_id)
-                    else:
-                        door_ids.append(mesh_id)
-                    continue
-                else:
-                    track_ids.append(mesh_id)
-                    usd_internal_path = f"/World/{mesh_id}"
-                mesh_dict = mesh_info_dict[mesh_id]
-                mesh_obj_i = mesh_dict['mesh']
-                static = mesh_dict['static']
-                articulation = mesh_dict.get('articulation', None)
-                texture = mesh_dict.get('texture', None)
-                mass = mesh_dict.get('mass', 1.0)
-
-                stage = convert_mesh_to_usd(stage, usd_internal_path,
-                                            mesh_obj_i.vertices, mesh_obj_i.faces,
-                                            collision_approximation, static, articulation, mass=mass, physics_iter=(16, 4),
-                                            apply_debug_torque=False, debug_torque_value=30.0, texture=texture,
-                                            usd_internal_art_reference_path=f"/World/{mesh_id}")
-
-            door_ids = sorted(door_ids)
-            door_frame_ids = sorted(door_frame_ids)
-
-            for door_id, door_frame_id in zip(door_ids, door_frame_ids):
-                usd_internal_path_door = f"/World/{door_id}"
-                usd_internal_path_door_frame = f"/World/{door_frame_id}"
-
-
-                mesh_dict_door = mesh_info_dict[door_id]
-                mesh_obj_door = mesh_dict_door['mesh']
-                articulation_door = mesh_dict_door.get('articulation', None)
-                texture_door = mesh_dict_door.get('texture', None)
-
-                mesh_dict_door_frame = mesh_info_dict[door_frame_id]
-                mesh_obj_door_frame = mesh_dict_door_frame['mesh']
-                texture_door_frame = mesh_dict_door_frame.get('texture', None)
-
-                stage = door_frame_to_usd(
-                    stage,
-                    usd_internal_path_door,
-                    usd_internal_path_door_frame,
-                    mesh_obj_door,
-                    mesh_obj_door_frame,
-                    articulation_door,
-                    texture_door,
-                    texture_door_frame
-                )
+            room_mesh_info_dict = export_single_room_layout_to_mesh_dict_list_from_room(target_room, layout_id)
+            collision_approximation = DEFAULT_COLLISION_APPROXIMATION
             # load placements info
             with open(placements_info_path, 'r') as f:
                 placements_info = json.load(f)
@@ -1119,8 +1103,8 @@ class MCPExtension(omni.ext.IExt):
             object_info = placements_info["object"]
             placed_object_mass = object_info.get("mass", 1.0)
 
-            mesh_info_dict = get_single_object_mesh_info_dict(scene_save_dir, object_info["source"], object_info["source_id"])
-            if mesh_info_dict is None:
+            object_mesh_info_dict = get_single_object_mesh_info_dict(scene_save_dir, object_info["source"], object_info["source_id"])
+            if object_mesh_info_dict is None:
                 return {
                     "status": "error",
                     "message": f"Object mesh not found: {object_info['source']}/{object_info['source_id']}"
@@ -1129,9 +1113,84 @@ class MCPExtension(omni.ext.IExt):
             mesh_id = "object_to_place"
             articulation = None
             static = False
-            texture = mesh_info_dict["texture"]
-            track_ids.append(mesh_id)
+            texture = object_mesh_info_dict["texture"]
             object_to_place_prim_path = f"/World/{mesh_id}"
+
+            def build_stage_for_object(transformed_mesh):
+                stage = Usd.Stage.CreateInMemory()
+                UsdGeom.Xform.Define(stage, "/World")
+                stage.SetDefaultPrim(stage.GetPrimAtPath("/World"))
+                UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+
+                track_ids = []
+                door_ids = []
+                door_frame_ids = []
+
+                for room_mesh_id, mesh_dict in room_mesh_info_dict.items():
+                    if room_mesh_id.startswith("wall_room_") or room_mesh_id.startswith("window_") or room_mesh_id.startswith("floor_"):
+                        usd_internal_path = f"/World/{room_mesh_id}"
+                    elif room_mesh_id.startswith("door_"):
+                        if room_mesh_id.endswith("_frame"):
+                            door_frame_ids.append(room_mesh_id)
+                        else:
+                            door_ids.append(room_mesh_id)
+                        continue
+                    else:
+                        track_ids.append(room_mesh_id)
+                        usd_internal_path = f"/World/{room_mesh_id}"
+
+                    mesh_obj_i = mesh_dict["mesh"]
+                    stage = convert_mesh_to_usd(
+                        stage,
+                        usd_internal_path,
+                        mesh_obj_i.vertices,
+                        mesh_obj_i.faces,
+                        collision_approximation,
+                        mesh_dict["static"],
+                        mesh_dict.get("articulation", None),
+                        mass=mesh_dict.get("mass", 1.0),
+                        physics_iter=(16, 4),
+                        apply_debug_torque=False,
+                        debug_torque_value=30.0,
+                        texture=mesh_dict.get("texture", None),
+                        usd_internal_art_reference_path=f"/World/{room_mesh_id}",
+                    )
+
+                for door_id, door_frame_id in zip(sorted(door_ids), sorted(door_frame_ids)):
+                    mesh_dict_door = room_mesh_info_dict[door_id]
+                    mesh_dict_door_frame = room_mesh_info_dict[door_frame_id]
+                    stage = door_frame_to_usd(
+                        stage,
+                        f"/World/{door_id}",
+                        f"/World/{door_frame_id}",
+                        mesh_dict_door["mesh"],
+                        mesh_dict_door_frame["mesh"],
+                        mesh_dict_door.get("articulation", None),
+                        mesh_dict_door.get("texture", None),
+                        mesh_dict_door_frame.get("texture", None),
+                    )
+
+                stage = convert_mesh_to_usd(
+                    stage,
+                    object_to_place_prim_path,
+                    transformed_mesh.vertices,
+                    transformed_mesh.faces,
+                    collision_approximation,
+                    static,
+                    articulation,
+                    mass=placed_object_mass,
+                    physics_iter=(16, 4),
+                    apply_debug_torque=False,
+                    debug_torque_value=30.0,
+                    texture=texture,
+                    usd_internal_art_reference_path=object_to_place_prim_path,
+                )
+                track_ids.append(mesh_id)
+
+                cache = UsdUtils.StageCache.Get()
+                stage_id = cache.Insert(stage).ToLongInt()
+                omni.usd.get_context().attach_stage_with_callback(stage_id)
+                return stage, track_ids
 
             safe_placements = []
 
@@ -1148,20 +1207,8 @@ class MCPExtension(omni.ext.IExt):
                 rotation_matrix_initial[:3, :3] = R.from_euler('xyz', [placement["rotation"]["x"], placement["rotation"]["y"], placement["rotation"]["z"]], degrees=False).as_matrix()
                 transform_matrix_initial = translation_matrix_initial @ rotation_matrix_initial
 
-                transformed_mesh = apply_object_transform_direct(mesh_info_dict["mesh"], placement["position"], placement["rotation"], degrees=False)
-                
-                stage = convert_mesh_to_usd(stage, object_to_place_prim_path,
-                                            transformed_mesh.vertices, transformed_mesh.faces,
-                                            collision_approximation, static, articulation, mass=placed_object_mass, physics_iter=(16, 4),
-                                            apply_debug_torque=False, debug_torque_value=30.0, texture=texture,
-                                            usd_internal_art_reference_path=object_to_place_prim_path)
-
-                cache = UsdUtils.StageCache.Get()
-                stage_id = cache.Insert(stage).ToLongInt()
-                omni.usd.get_context().attach_stage_with_callback(stage_id)
-
-                # Set the world axis of the stage root layer to Z
-                UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+                transformed_mesh = apply_object_transform_direct(object_mesh_info_dict["mesh"], placement["position"], placement["rotation"], degrees=False)
+                stage, track_ids = build_stage_for_object(transformed_mesh)
                 
                 # simulate the scene
                 print(f"start first simulation test")
@@ -1192,7 +1239,7 @@ class MCPExtension(omni.ext.IExt):
 
                 # validate the placement
                 transformed_mesh = apply_object_transform_direct(
-                    mesh_info_dict["mesh"], 
+                    object_mesh_info_dict["mesh"],
                     {
                         "x": position_simulated[0],
                         "y": position_simulated[1],
@@ -1236,18 +1283,7 @@ class MCPExtension(omni.ext.IExt):
                     continue
 
                 if not unstable_addition:
-                    stage = convert_mesh_to_usd(stage, object_to_place_prim_path,
-                                                transformed_mesh.vertices, transformed_mesh.faces,
-                                                collision_approximation, static, articulation, mass=placed_object_mass, physics_iter=(16, 4),
-                                                apply_debug_torque=False, debug_torque_value=30.0, texture=texture,
-                                                usd_internal_art_reference_path=object_to_place_prim_path)
-
-                    cache = UsdUtils.StageCache.Get()
-                    stage_id = cache.Insert(stage).ToLongInt()
-                    omni.usd.get_context().attach_stage_with_callback(stage_id)
-
-                    # Set the world axis of the stage root layer to Z
-                    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+                    stage, track_ids = build_stage_for_object(transformed_mesh)
                     
                     # simulate the scene
                     prims, prim_paths = get_all_prims_with_paths(track_ids)
@@ -1320,6 +1356,13 @@ class MCPExtension(omni.ext.IExt):
 
         return Usd.Stage.CreateNew(usd_file_path)
 
+    def _export_stage_snapshot(self, stage, scene_save_dir: str, base_name: str) -> str:
+        os.makedirs(scene_save_dir, exist_ok=True)
+        usd_file_path = os.path.abspath(os.path.join(scene_save_dir, f"{base_name}.usd"))
+        if not stage.GetRootLayer().Export(usd_file_path):
+            raise RuntimeError(f"Failed to export USD stage: {usd_file_path}")
+        return usd_file_path
+
     def get_room_layout_scene_usd(self, scene_save_dir: str, usd_file_path: str):
         """
         Create a room layout scene from a dictionary of mesh information.
@@ -1347,7 +1390,7 @@ class MCPExtension(omni.ext.IExt):
 
             stage = self._create_fresh_usd_stage(usd_file_path)
 
-            collision_approximation = "sdf"
+            collision_approximation = DEFAULT_COLLISION_APPROXIMATION
             
 
             world_base_prim = UsdGeom.Xform.Define(stage, "/World")
@@ -1438,7 +1481,7 @@ class MCPExtension(omni.ext.IExt):
 
         stage = self._create_fresh_usd_stage(usd_file_path)
 
-        collision_approximation = "sdf"
+        collision_approximation = DEFAULT_COLLISION_APPROXIMATION
         # collision_approximation = "convexDecomposition"
         
 

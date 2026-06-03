@@ -447,11 +447,18 @@ def create_room_meshes_with_openings(room: Room, processed_doors: set, processed
     
     # Create each wall
     for wall in room.walls:
-        wall_mesh = create_wall_mesh(wall, room)
         wall_ids.append(wall.id)
         # Find doors and windows on this wall
         wall_doors = [door for door in room.doors if door.wall_id == wall.id]
         wall_windows = [window for window in room.windows if window.wall_id == wall.id]
+
+        wall_openings = []
+        for door in wall_doors:
+            wall_openings.append(_opening_interval_for_door(wall, door))
+        for window in wall_windows:
+            wall_openings.append(_opening_interval_for_window(wall, window))
+
+        wall_mesh = create_wall_mesh_with_openings(wall, room, wall_openings)
         
         # Create door meshes and subtract from wall
         for door in wall_doors:
@@ -462,18 +469,6 @@ def create_room_meshes_with_openings(room: Room, processed_doors: set, processed
                     door_meshes.append(door_mesh)
                 processed_doors.add(door_id)
                 door_ids.append(door_id)
-                # Cut door opening from wall
-                try:
-                    wall_mesh = wall_mesh.difference(door_mesh, engine="manifold")
-                except:
-                    # If boolean operation fails, just subtract a simple box
-                    opening_mesh = create_door_opening_mesh(wall, door)
-                    try:
-                        wall_mesh = wall_mesh.difference(opening_mesh, engine="manifold")
-                    except:
-                        print(f"Boolean operation failed for door {door.id} on wall {wall.id}")
-                        print(f"Boolean operation failed for door {door.id} on wall {wall.id}", file=sys.stderr)
-                        pass  # Keep original wall if boolean ops fail
         
         # Create window meshes and subtract from wall
         for window in wall_windows:
@@ -483,23 +478,135 @@ def create_room_meshes_with_openings(room: Room, processed_doors: set, processed
                 window_meshes.append(window_mesh)
                 processed_windows.add(window_id)
                 window_ids.append(window.id)
-                # Cut window opening from wall
-                try:
-                    wall_mesh = wall_mesh.difference(window_mesh, engine="manifold")
-                except:
-                    # If boolean operation fails, just subtract a simple box
-                    opening_mesh = create_window_opening_mesh(wall, window)
-                    try:
-                        wall_mesh = wall_mesh.difference(opening_mesh, engine="manifold")
-                    except:
-                        print(f"Boolean operation failed for window {window.id} on wall {wall.id}")
-                        print(f"Boolean operation failed for window {window.id} on wall {wall.id}", file=sys.stderr)
-                        pass  # Keep original wall if boolean ops fail
         
         wall_meshes.append(wall_mesh)
     
     return wall_meshes, door_meshes, window_meshes, wall_ids, door_ids, window_ids
 
+
+
+def _wall_length(wall: Wall) -> float:
+    start = np.array([wall.start_point.x, wall.start_point.y, wall.start_point.z], dtype=np.float64)
+    end = np.array([wall.end_point.x, wall.end_point.y, wall.end_point.z], dtype=np.float64)
+    return float(np.linalg.norm(end - start))
+
+
+def _opening_interval_for_door(wall: Wall, door: Door) -> tuple[float, float, float, float]:
+    wall_length = _wall_length(wall)
+    center = wall_length * door.position_on_wall
+    return (
+        center - door.width / 2,
+        center + door.width / 2,
+        0.0,
+        door.height,
+    )
+
+
+def _opening_interval_for_window(wall: Wall, window: Window) -> tuple[float, float, float, float]:
+    wall_length = _wall_length(wall)
+    center = wall_length * window.position_on_wall
+    return (
+        center - window.width / 2,
+        center + window.width / 2,
+        window.sill_height,
+        window.sill_height + window.height,
+    )
+
+
+def create_wall_mesh_with_openings(
+    wall: Wall,
+    room: Room,
+    openings: list[tuple[float, float, float, float]],
+) -> trimesh.Trimesh:
+    """Create a wall mesh with rectangular openings without boolean operations."""
+    wall_length = _wall_length(wall)
+    if wall_length <= 1e-6:
+        return create_wall_mesh(wall, room)
+
+    clipped_openings = []
+    for s_min, s_max, z_min, z_max in openings:
+        s_min = max(0.0, min(wall_length, s_min))
+        s_max = max(0.0, min(wall_length, s_max))
+        z_min = max(0.0, min(wall.height, z_min))
+        z_max = max(0.0, min(wall.height, z_max))
+        if s_max - s_min > 1e-5 and z_max - z_min > 1e-5:
+            clipped_openings.append((s_min, s_max, z_min, z_max))
+
+    if not clipped_openings:
+        return create_wall_mesh(wall, room)
+
+    s_breaks = [0.0, wall_length]
+    z_breaks = [0.0, wall.height]
+    for s_min, s_max, z_min, z_max in clipped_openings:
+        s_breaks.extend([s_min, s_max])
+        z_breaks.extend([z_min, z_max])
+
+    s_breaks = sorted(set(round(value, 8) for value in s_breaks))
+    z_breaks = sorted(set(round(value, 8) for value in z_breaks))
+
+    segments = []
+    for s0, s1 in zip(s_breaks[:-1], s_breaks[1:]):
+        if s1 - s0 <= 1e-5:
+            continue
+        for z0, z1 in zip(z_breaks[:-1], z_breaks[1:]):
+            if z1 - z0 <= 1e-5:
+                continue
+
+            s_mid = (s0 + s1) / 2
+            z_mid = (z0 + z1) / 2
+            inside_opening = any(
+                s_min < s_mid < s_max and z_min < z_mid < z_max
+                for s_min, s_max, z_min, z_max in clipped_openings
+            )
+            if inside_opening:
+                continue
+
+            segments.append(_create_wall_segment_mesh(wall, room, s0, s1, z0, z1))
+
+    if not segments:
+        return create_wall_mesh(wall, room)
+    return trimesh.util.concatenate(segments)
+
+
+def _create_wall_segment_mesh(
+    wall: Wall,
+    room: Room,
+    s_min: float,
+    s_max: float,
+    z_min: float,
+    z_max: float,
+) -> trimesh.Trimesh:
+    start = np.array([wall.start_point.x, wall.start_point.y, wall.start_point.z], dtype=np.float64)
+    end = np.array([wall.end_point.x, wall.end_point.y, wall.end_point.z], dtype=np.float64)
+    wall_vector = end - start
+    wall_length = np.linalg.norm(wall_vector)
+    wall_direction = wall_vector / wall_length
+
+    room_center = np.array([
+        room.position.x + room.dimensions.width / 2,
+        room.position.y + room.dimensions.length / 2,
+        room.position.z,
+    ], dtype=np.float64)
+
+    segment_center = start + wall_direction * ((s_min + s_max) / 2)
+    wall_center = (start + end) / 2
+    normal1 = np.array([wall_direction[1], -wall_direction[0], 0], dtype=np.float64)
+    normal2 = np.array([-wall_direction[1], wall_direction[0], 0], dtype=np.float64)
+    wall_to_room = room_center - wall_center
+    inward_normal = normal1 if np.dot(normal1, wall_to_room) > 0 else normal2
+
+    half_thickness = wall.thickness / 2
+    segment_center[2] = wall.start_point.z + (z_min + z_max) / 2
+    segment_center = segment_center + inward_normal * (half_thickness / 2)
+
+    wall_box = trimesh.creation.box(
+        extents=[s_max - s_min, half_thickness, z_max - z_min]
+    )
+    angle = np.arctan2(wall_direction[1], wall_direction[0])
+    rotation_matrix = trimesh.transformations.rotation_matrix(angle, [0, 0, 1])
+    transform = trimesh.transformations.translation_matrix(segment_center) @ rotation_matrix
+    wall_box.apply_transform(transform)
+    return wall_box
 
 
 def create_wall_mesh(wall: Wall, room: Room) -> trimesh.Trimesh:

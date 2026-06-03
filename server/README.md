@@ -14,7 +14,7 @@ SAGE 提供以下 conda 环境，根据你的 GPU 选择：
 
 **关键区别**：
 - `env_isaaclab` 是 IsaacLab 数据生成的**唯一可用环境**（需要 Python 3.11 + PyTorch 2.8+）
-- `sage` / `sage5080` 仅用于 MCP 客户端（场景生成），不直接启动 Isaac Sim
+- `sage` / `sage5080` 用于场景生成客户端与 Isaac Sim MCP wrapper；IsaacLab 数据生成仍必须使用 `env_isaaclab`
 
 ### 配置 env_isaaclab（IsaacLab 数据生成）
 
@@ -64,7 +64,7 @@ cd /home/gaok/coding/sage
 conda activate sage5080
 ./client/isaac_sim_conda.sh \
   --no-window \
-  omni.isaac.sim \
+  --experience isaacsim.exp.base.kit \
   --ext-folder /home/gaok/coding/sage/server/isaacsim \
   --enable isaac.sim.mcp_extension
 ```
@@ -77,10 +77,38 @@ conda activate sage5080
 ss -ltnp | grep 11323
 ```
 
-注意：直接启动 `isaacsim.exp.full.kit` 只能打开普通 Isaac Sim，不会启动 SAGE 的 MCP socket。预览图和 critic 流程必须使用上面的 `--ext-folder ... --enable isaac.sim.mcp_extension` 启动方式。
+注意：直接启动 `isaacsim.exp.full.kit` 只能打开普通 Isaac Sim，不会启动 SAGE 的 MCP socket。预览图和 critic 流程必须使用上面的 `--ext-folder ... --enable isaac.sim.mcp_extension` 启动方式。源码版 Isaac Sim 的 `isaac-sim.sh` 默认会强制加载 Full experience，SAGE 的 `client/isaac_sim_conda.sh` 会直接调用 `kit/kit` 来确保 `--experience isaacsim.exp.base.kit` 生效。
+
+Isaac MCP 的默认碰撞近似为 `convexDecomposition`，可通过环境变量覆盖：
+```bash
+SAGE_COLLISION_APPROXIMATION=convexHull ./client/isaac_sim_conda.sh ...
+```
+不要在常规生成里使用 `sdf`。如果日志出现 `cudaErrorIllegalAddress`、`createSDFBuilder` 或 PhysX GPU SDF cooking 相关崩溃，优先确认没有覆盖成 `sdf`，并确认启动日志路径是 `Isaac-Sim Base/5.1` 而不是 `Isaac-Sim Full/5.1`。
 
 ### 1.2.1 Isaac 预览图验证
 预览图只允许使用 Isaac Sim/Replicator 渲染；CPU fallback 已关闭。Isaac MCP 未启动、渲染失败、生成全黑/全白图时会直接报错。
+
+无机器人房间生成在 physics critic 成功后会默认自动生成 Isaac 预览图：
+```bash
+server/results/<layout_id>/preview/<room_id>_rendered_view_*.png
+```
+可用环境变量控制：
+```bash
+export SAGE_RENDER_PREVIEW=1          # 默认 1；设为 0 可跳过自动预览图
+export SAGE_PREVIEW_RESOLUTION=512    # 默认 512
+export SAGE_PREVIEW_VIEWS=4           # 默认 4
+export SAGE_REQUIRE_ISAAC_PREVIEW=1   # 默认 1；预览失败时让生成报错
+```
+
+语义 critic 会优先把同一批 Isaac Sim/Replicator 渲染图作为 VLM 的 perspective 输入，并复制到：
+```bash
+server/vis/<room_id>_rendered_view_*.png
+```
+对应开关：
+```bash
+export SAGE_USE_ISAAC_RENDER_FOR_VLM=1     # 默认 1
+export SAGE_REQUIRE_ISAAC_VLM_RENDERS=1    # 默认 1；VLM 渲染图缺失时让 critic 报错
+```
 
 手动验证某个 layout 的预览图：
 ```bash
@@ -96,6 +124,20 @@ ls server/results/layout_7c95fb4c/preview/*_rendered_view_*.png
 ```
 
 如果报 `ConnectionRefusedError`，先确认 MCP 端口监听和 Isaac 启动命令；如果报 invalid preview，检查 Isaac 日志中的 `render_room_preview`、`Replicator`、`BasicWriter` 相关错误。
+
+如果 Isaac 启动时报 `Address already in use`，说明同一端口已经有一个 Isaac MCP 服务在运行。先确认并清理旧进程：
+```bash
+ss -ltnp | grep 11323
+```
+也可以显式换端口启动，并让客户端使用同一个端口：
+```bash
+ISAAC_MCP_PORT=11324 ./client/isaac_sim_conda.sh \
+  --no-window \
+  --experience isaacsim.exp.base.kit \
+  --ext-folder /home/gaok/coding/sage/server/isaacsim \
+  --enable isaac.sim.mcp_extension
+```
+客户端命令也需要带同一个端口，例如 `ISAAC_MCP_PORT=11324 python server/isaaclab/layout_preview.py ...`。
 
 
 ### 1.3 视觉语言模型（VLM）
@@ -181,10 +223,10 @@ curl http://127.0.0.1:8080/health
 ### 终端 2：Isaac Sim MCP 服务端
 ```bash
 cd /home/gaok/coding/sage
-conda activate sage
+conda activate sage5080
 ./client/isaac_sim_conda.sh \
   --no-window \
-  omni.isaac.sim \
+  --experience isaacsim.exp.base.kit \
   --ext-folder /home/gaok/coding/sage/server/isaacsim \
   --enable isaac.sim.mcp_extension
 ```
@@ -197,7 +239,7 @@ conda activate sage
 ss -ltnp | grep 11323
 ```
 
-注意：直接启动 `isaacsim.exp.full.kit` 只能打开普通 Isaac Sim，不会启动 SAGE 的 MCP socket。预览图和 critic 流程必须使用上面的 `--ext-folder ... --enable isaac.sim.mcp_extension` 启动方式。
+注意：直接启动 `isaacsim.exp.full.kit` 只能打开普通 Isaac Sim，不会启动 SAGE 的 MCP socket。预览图和 critic 流程必须使用上面的 `--ext-folder ... --enable isaac.sim.mcp_extension` 启动方式。源码版 Isaac Sim 的 `isaac-sim.sh` 默认会强制加载 Full experience，SAGE 的 `client/isaac_sim_conda.sh` 会直接调用 `kit/kit` 来确保 `--experience isaacsim.exp.base.kit` 生效。
 
 ### 终端 3：运行 SAGE 后端 / 生成端
 低显存默认运行方式：

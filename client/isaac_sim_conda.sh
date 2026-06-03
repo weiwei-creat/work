@@ -28,6 +28,43 @@ which python
 export ISAACSIM_PATH="${ISAACSIM_PATH}"
 export ISAACLAB_PATH="${ISAACLAB_PATH}"
 export RESOURCE_NAME="IsaacSim"
+export OLD_PYTHONPATH="${PYTHONPATH:-}"
+
+EXPERIENCE_KIT="${SAGE_ISAAC_EXPERIENCE:-}"
+ISAAC_ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --experience)
+            if [[ $# -lt 2 ]]; then
+                echo "[ERROR] --experience requires a kit filename or absolute path" >&2
+                exit 1
+            fi
+            EXPERIENCE_KIT="$2"
+            shift 2
+            ;;
+        --experience=*)
+            EXPERIENCE_KIT="${1#--experience=}"
+            shift
+            ;;
+        *)
+            ISAAC_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+set -- "${ISAAC_ARGS[@]}"
+
+resolve_experience_path() {
+    local install_root="$1"
+    local default_kit="$2"
+    local selected_kit="${EXPERIENCE_KIT:-${default_kit}}"
+
+    if [[ "${selected_kit}" = /* ]]; then
+        printf '%s\n' "${selected_kit}"
+    else
+        printf '%s\n' "${install_root}/apps/${selected_kit}"
+    fi
+}
 
 if [ -x "${ISAACSIM_PATH}/kit/kit" ]; then
     # Isaac Sim Kit environment variables for extracted binary installs.
@@ -79,29 +116,57 @@ echo "[INFO] Isaac Sim path: ${ISAACSIM_PATH}"
 echo "[INFO] Starting Isaac Sim..."
 
 if [ -x "${ISAACSIM_PATH}/kit/kit" ]; then
+    EXPERIENCE_PATH="$(resolve_experience_path "${ISAACSIM_PATH}" "omni.isaac.sim.kit")"
+    if [ ! -f "${EXPERIENCE_PATH}" ]; then
+        echo "[ERROR] Isaac experience not found: ${EXPERIENCE_PATH}" >&2
+        exit 1
+    fi
+
     cd "${ISAACSIM_PATH}"
+    echo "[INFO] Using Isaac experience: ${EXPERIENCE_PATH}"
     if [ -d "${ISAACLAB_PATH}/source/extensions" ]; then
         echo "[INFO] Including Isaac Lab extensions from: ${ISAACLAB_PATH}/source/extensions"
-        exec "${ISAACSIM_PATH}/kit/kit" "${ISAACSIM_PATH}/apps/omni.isaac.sim.kit" \
+        exec "${ISAACSIM_PATH}/kit/kit" "${EXPERIENCE_PATH}" \
             --ext-folder "${ISAACSIM_PATH}/apps" \
             --ext-folder "${ISAACLAB_PATH}/source/extensions" \
             "$@"
     else
         echo "[INFO] Running Isaac Sim without Isaac Lab extensions"
-        exec "${ISAACSIM_PATH}/kit/kit" "${ISAACSIM_PATH}/apps/omni.isaac.sim.kit" \
+        exec "${ISAACSIM_PATH}/kit/kit" "${EXPERIENCE_PATH}" \
             --ext-folder "${ISAACSIM_PATH}/apps" \
             "$@"
     fi
 elif [ -x "${RELEASE_ROOT}/isaac-sim.sh" ]; then
+    EXPERIENCE_PATH="$(resolve_experience_path "${RELEASE_ROOT}" "isaacsim.exp.full.kit")"
+    if [ ! -f "${EXPERIENCE_PATH}" ]; then
+        echo "[ERROR] Isaac experience not found: ${EXPERIENCE_PATH}" >&2
+        exit 1
+    fi
+
     cd "${RELEASE_ROOT}"
+    NO_ROS_ENV=false
+    for arg in "$@"; do
+        if [ "${arg}" = "--no-ros-env" ]; then
+            NO_ROS_ENV=true
+            echo "[INFO] Skipping automatic ROS environment setup"
+            break
+        fi
+    done
+    if [ "${NO_ROS_ENV}" = "false" ] && [ -f "${RELEASE_ROOT}/setup_ros_env.sh" ]; then
+        # Match isaac-sim.sh behavior while still honoring the selected experience.
+        # shellcheck disable=SC1091
+        source "${RELEASE_ROOT}/setup_ros_env.sh"
+    fi
+
+    echo "[INFO] Using Isaac experience: ${EXPERIENCE_PATH}"
     if [ -d "${ISAACLAB_PATH}/source/extensions" ]; then
         echo "[INFO] Including Isaac Lab extensions from: ${ISAACLAB_PATH}/source/extensions"
-        exec "${RELEASE_ROOT}/isaac-sim.sh" \
+        exec "${RELEASE_ROOT}/kit/kit" "${EXPERIENCE_PATH}" \
             --ext-folder "${ISAACLAB_PATH}/source/extensions" \
             "$@"
     else
         echo "[INFO] Running Isaac Sim without Isaac Lab extensions"
-        exec "${RELEASE_ROOT}/isaac-sim.sh" "$@"
+        exec "${RELEASE_ROOT}/kit/kit" "${EXPERIENCE_PATH}" "$@"
     fi
 else
     echo "[ERROR] Could not find an Isaac Sim launcher under ${ISAACSIM_PATH}" >&2

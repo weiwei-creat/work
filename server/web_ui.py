@@ -27,7 +27,7 @@ CLIENT_ROOT = SAGE_ROOT / "client"
 RESULTS_ROOT = SERVER_ROOT / "results"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 
-DEFAULT_ISAAC_CMD = "./client/isaac_sim_conda.sh --no-window omni.isaac.sim --ext-folder /home/gaok/coding/sage/server/isaacsim --enable isaac.sim.mcp_extension"
+DEFAULT_ISAAC_CMD = "./client/isaac_sim_conda.sh --no-window --experience isaacsim.exp.base.kit --ext-folder /home/gaok/coding/sage/server/isaacsim --enable isaac.sim.mcp_extension"
 DEFAULT_TRELLIS_CMD = "bash scripts/start_trellis_server.sh 8080 /home/gaok/coding/TRELLIS trellis5080"
 ISAAC_HOST = os.environ.get("SAGE_ISAAC_HOST", "localhost")
 DEFAULT_GENERATION_PYTHON = os.environ.get(
@@ -1127,10 +1127,17 @@ def scene_render_images_for_layout(layout_id: str) -> list[Path]:
     room_ids = layout_room_ids(layout_id)
     if not room_ids:
         return []
+    images: list[Path] = []
+    preview_dir = RESULTS_ROOT / layout_id / "preview"
+    if preview_dir.exists():
+        for room_id in room_ids:
+            images.extend(preview_dir.glob(f"{room_id}_rendered_view_*.png"))
+
     vis_dir = SERVER_ROOT / "vis"
     if not vis_dir.exists():
-        return []
-    images: list[Path] = []
+        unique_images = {path.resolve() for path in images if path.is_file() and is_scene_render_image(path)}
+        return sorted(unique_images, key=lambda path: (0, -path.stat().st_mtime))
+
     for room_id in room_ids:
         patterns = [
             f"{room_id}_rendered_view_*.png",

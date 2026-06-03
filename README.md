@@ -54,19 +54,36 @@ SAGE 是一个智能体驱动的框架，能够根据用户指定的具身任务
 ### 1. 服务端设置
 **[阅读服务端文档](server/README.md)**
   - 后端基础设施的设置说明。
-  - VLM（Qwen）、LLM（GPT）和 3D 生成模型（TRELLIS）的托管细节。
+  - VLM（DashScope/Qwen）、LLM（DeepSeek/兼容接口）和 3D 生成模型（TRELLIS）的托管细节。
   - 运行数据增强管线的指南。
 
 ### 2. 客户端设置
 **[阅读客户端文档](client/README.md)**
   - Python 环境和依赖的安装。
-  - 安装和关联 NVIDIA Isaac Sim 的说明。
+  - 启动和连接 NVIDIA Isaac Sim MCP 服务的说明。
   - 运行场景生成、机器人任务生成和可视化的脚本。
 
 ### 使用流程
 1.  **启动后端**：按照服务端 README 的说明启动 Isaac Sim MCP，并根据配置选择 Objathor 检索或 TRELLIS 生成。低显存机器默认可不启动 TRELLIS。
 2.  **配置客户端**：在客户端目录中设置 `key.json` 和环境变量。
 3.  **运行生成**：使用 `client/scripts/` 中的脚本来生成场景（如 `generate_from_room_desc.sh`）或机器人数据。
+
+> Isaac Sim 5.x 的 MCP 服务请使用 `server/README.md` 中的 `./client/isaac_sim_conda.sh --experience isaacsim.exp.base.kit ... --enable isaac.sim.mcp_extension` 启动方式。不要直接启动 `isaacsim.exp.full.kit`，否则容易只打开普通 Isaac Sim 而没有 SAGE MCP socket。
+
+### 关闭 Isaac Sim MCP 服务
+如果 Isaac Sim MCP 是在当前终端前台启动的，直接按 `Ctrl+C` 即可退出。
+
+如果服务在后台运行，先查出监听 MCP 端口的进程，再关闭它：
+```bash
+ss -ltnp | grep 11323
+kill <PID>
+```
+
+如果使用了自定义端口，例如 `ISAAC_MCP_PORT=11324`，把下面的 `11323` 替换成对应端口。确认关闭成功：
+```bash
+ss -ltnp | grep 11323
+```
+没有输出即表示该端口上的 Isaac MCP 服务已停止。
 
 ### 低显存资产模式
 默认资产来源为 Objathor 现有资产检索，适合 16GB 显存或更小显存的机器：

@@ -12,31 +12,28 @@ Install the `sage` Python environment using the provided configuration at `./env
 2.  **Configuration:** Update the Matfuse directory path in `./constant.py`.
 *   *Note:* Flux is also supported. See `./start_flux_server.sh` (Requires `HF_TOKEN`).
 
-### 1.3 Isaac Sim Installation
-1.  **Download:** Download **Isaac Sim 4.2.0** from the [NVIDIA Archives](https://docs.isaacsim.omniverse.nvidia.com/4.5.0/installation/download.html).
-2.  **Install:** Extract to your preferred directory (e.g., `~/isaacsim`).
-3.  **Link Extension:** Symlink the MCP extension to the Isaac Sim extensions directory to enable server connection:
+### 1.3 Isaac Sim MCP Service
+SAGE is currently verified with Isaac Sim 5.1. Set `ISAAC_SIM_PATH` if Isaac Sim is not installed in the default location used by `client/isaac_sim_conda.sh`.
+
+The MCP extension is loaded from `server/isaacsim` at launch time, so no symlink into the Isaac Sim install directory is required.
+
+Start the service from the repo root:
 ```bash
-ln -s $(realpath ../server/isaacsim/isaac.sim.mcp_extension) ~/isaacsim/exts/isaac.sim.mcp_extension
+cd /home/gaok/coding/sage
+conda activate sage5080
+./client/isaac_sim_conda.sh \
+  --no-window \
+  --experience isaacsim.exp.base.kit \
+  --ext-folder /home/gaok/coding/sage/server/isaacsim \
+  --enable isaac.sim.mcp_extension
 ```
 
-### 1.4 Start MCP Client VLM (Thinking Version)
-We utilize **Qwen3-VL-32B-Thinking** hosted with vllm.
+Verify the connection: the Isaac log should contain `Isaac Sim MCP server started on localhost:11323` or the port assigned from `SLURM_JOB_ID`.
 
-```bash
-# Download model
-hf download Qwen/Qwen3-VL-32B-Thinking --local-dir /tmp/Qwen3-VL-32B-Thinking
+For Isaac Sim 5.x source builds, keep `--experience isaacsim.exp.base.kit`. The wrapper launches `kit/kit` directly so this experience is honored instead of falling back to the Full app.
 
-# Serve model
-cd /tmp
-vllm serve Qwen3-VL-32B-Thinking \
-    --port 8080 \
-    --trust-remote-code \
-    --async-scheduling \
-    --mm-processor-cache-gb 0 \
-    --tensor-parallel-size 8 \
-    --reasoning-parser qwen3
-```
+### 1.4 VLM / LLM Configuration
+The current default flow uses hosted API endpoints configured in `.env` and `client/key.json`; no local VLM service is required unless you explicitly choose self-hosting. See `../server/README.md` for the current DashScope / DeepSeek and optional self-hosted Qwen3-VL setup.
 
 ### 1.5 Configuration
 Fill in the API token and URL in `./key.json`.
@@ -44,8 +41,7 @@ Fill in the API token and URL in `./key.json`.
 ## 2. Scene Generation Usage
 
 ### 2.1 Start Isaac Sim (Background Service)
-First, start the Isaac Sim server. Modify the start script if necessary at `./isaac_sim_conda.sh`.
-*   Verify the connection: You should see a connection to `localhost:xxxxx` in the output.
+Start the Isaac Sim MCP server from the repo root using the command in section 1.3 before running generation scripts.
 
 ### 2.2 Generation Commands
 Once Isaac Sim is running, use the following scripts to generate scenes.

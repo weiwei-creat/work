@@ -8,8 +8,6 @@ keywords = ["mcp", "server", "socket", "simulation", "robotics"]
 
 [dependencies]
 "omni.isaac.core" = {}
-"omni.kit.uiapp" = {}
-"omni.isaac.ui" = {}
 
 
 
