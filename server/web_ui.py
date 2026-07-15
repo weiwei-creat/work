@@ -10,6 +10,7 @@ import json
 import os
 import queue
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -35,7 +36,11 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 # robot generations. The next /api/generate closes the display process and
 # brings the headless kit back automatically.
 # SAGE_ISAAC_WINDOW=1 restores the old windowed-kit behavior (debug only).
-_ISAAC_FLAGS = "--experience isaacsim.exp.base.kit --ext-folder /home/gaok/coding/sage/server/isaacsim --enable isaac.sim.mcp_extension"
+_ISAAC_FLAGS = (
+    "--experience isaacsim.exp.base.kit "
+    f"--ext-folder {shlex.quote(str(SERVER_ROOT / 'isaacsim'))} "
+    "--enable isaac.sim.mcp_extension"
+)
 _ISAAC_DISPLAY = os.environ.get("SAGE_ISAAC_DISPLAY", ":0")
 _want_isaac_window = os.environ.get("SAGE_ISAAC_WINDOW", "0").strip().lower() not in {"0", "false", "no"}
 _display_available = Path(f"/tmp/.X11-unix/X{_ISAAC_DISPLAY.lstrip(':').split('.')[0]}").exists()
@@ -46,9 +51,14 @@ else:
 
 # GUI display processes (post-generation). Run with Isaac's own python.sh so
 # they boot an independent SimulationApp — the headless kit is stopped first.
+_isaac_root = Path(os.environ.get("ISAAC_SIM_PATH", "/home/ubuntu/isaac"))
+_isaac_python_candidates = (
+    _isaac_root / "python.sh",
+    _isaac_root / "_build/linux-x86_64/release/python.sh",
+)
 ISAAC_PYTHON_SH = os.environ.get(
     "SAGE_ISAAC_PYTHON_SH",
-    "/home/gaok/coding/isaacsim/_build/linux-x86_64/release/python.sh",
+    str(next((path for path in _isaac_python_candidates if path.exists()), _isaac_python_candidates[0])),
 )
 SCENE_VIEWER_SCRIPT = "server/isaacsim/scene_viewer.py"
 G1_WALK_SCRIPT = "server/isaacsim/isaac.sim.mcp_extension/examples/run_g1_walk.sh"
@@ -56,13 +66,16 @@ G1_WALK_SCRIPT = "server/isaacsim/isaac.sim.mcp_extension/examples/run_g1_walk.s
 # NOTE: the repo's IsaacLab fork (0.30.x / Isaac 4.2-era) does NOT load against
 # Isaac Sim 5.1, so the original data_generation_* runners cannot be used here.
 FRANKA_VIZ_SCRIPT = "server/isaacsim/isaac.sim.mcp_extension/examples/franka_task_render.py"
-DEFAULT_TRELLIS_CMD = "bash scripts/start_trellis_server.sh 8080 /home/gaok/coding/TRELLIS trellis5080"
+_trellis_root = os.environ.get("TRELLIS_ROOT", str(SAGE_ROOT.parent / "TRELLIS"))
+_trellis_env = os.environ.get("TRELLIS_CONDA_ENV", "trellis")
+DEFAULT_TRELLIS_CMD = (
+    f"bash scripts/start_trellis_server.sh 8080 "
+    f"{shlex.quote(_trellis_root)} {shlex.quote(_trellis_env)}"
+)
 ISAAC_HOST = os.environ.get("SAGE_ISAAC_HOST", "localhost")
 DEFAULT_GENERATION_PYTHON = os.environ.get(
     "SAGE_GENERATION_PYTHON",
-    str(Path("/home/gaok/anaconda3/envs/sage/bin/python"))
-    if Path("/home/gaok/anaconda3/envs/sage/bin/python").exists()
-    else sys.executable,
+    sys.executable,
 )
 DEFAULT_MAX_TOOL_CALLS = int(os.environ.get("SAGE_MAX_TOOL_CALLS", "40"))
 

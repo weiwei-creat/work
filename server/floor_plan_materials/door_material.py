@@ -26,7 +26,42 @@ OBJATHOR_ASSETS_BASE_DIR = os.environ.get(
     "OBJATHOR_ASSETS_BASE_DIR", os.path.expanduser(f"~/.objathor-assets")
 )
 
-HOLODECK_BASE_DATA_DIR = os.path.join(OBJATHOR_ASSETS_BASE_DIR, "holodeck", ASSETS_VERSION)
+_REPO_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "objathor")
+)
+_OBJATHOR_ROOT = os.path.abspath(
+    os.environ.get("SAGE_OBJATHOR_ROOT", _REPO_ROOT)
+)
+_REPO_OBJATHOR_DIR = os.path.join(_OBJATHOR_ROOT, ASSETS_VERSION)
+_REPO_DOOR_DOWNLOAD_DIR = os.path.abspath(
+    os.path.join(
+        _OBJATHOR_ROOT,
+        "doors",
+        ".objathor-assets",
+        "holodeck",
+        ASSETS_VERSION,
+    )
+)
+_STANDARD_HOLODECK_DIR = os.path.join(
+    OBJATHOR_ASSETS_BASE_DIR, "holodeck", ASSETS_VERSION
+)
+_DEFAULT_HOLODECK_DIR = (
+    _STANDARD_HOLODECK_DIR
+    if os.path.isdir(os.path.join(_STANDARD_HOLODECK_DIR, "doors", "textures"))
+    else _REPO_OBJATHOR_DIR
+)
+# The documented component-wise download command stores the complete door
+# bundle under objathor/doors/.objathor-assets while the merged repository
+# directory may contain only the database and preview images.
+if (
+    not os.path.isdir(os.path.join(_DEFAULT_HOLODECK_DIR, "doors", "textures"))
+    and os.path.isdir(os.path.join(_REPO_DOOR_DOWNLOAD_DIR, "doors", "textures"))
+):
+    _DEFAULT_HOLODECK_DIR = _REPO_DOOR_DOWNLOAD_DIR
+HOLODECK_BASE_DATA_DIR = os.environ.get(
+    "HOLODECK_BASE_DATA_DIR",
+    _DEFAULT_HOLODECK_DIR,
+)
 
 
 class DoorMaterialSelector:

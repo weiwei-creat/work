@@ -764,11 +764,13 @@ class MCPClientOAI:
 
             try:
                 if is_python:
-                    # Run Python scripts with conda environment and required env vars
+                    # Run the layout server with the same interpreter as the client by
+                    # default.  This keeps local conda runs portable and also allows the
+                    # client to run inside a container that has no conda executable.
                     import os
                     import shlex
                     abs_script_path = os.path.abspath(server_script_path)
-                    conda_env_name = os.environ.get("CONDA_ENV_NAME", "sage")
+                    server_python = os.environ.get("SAGE_SERVER_PYTHON", sys.executable)
                     
                     # Forward ALL SAGE_* tuning vars to the layout server. Without this
                     # the MCP server (started via conda run + bash -c) never sees knobs
@@ -780,26 +782,23 @@ class MCPClientOAI:
                         if k.startswith("SAGE_") and v is not None
                     )
 
-                    # Create a bash command that sets up conda env and runs the script
+                    # Create a bash command that forwards runtime tuning and starts the
+                    # stdio MCP server.  CONDA_PREFIX is optional in container images.
                     server_command = (
                         f"cd {SERVER_DIR} && "
-                        f"export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH && "
-                        f"export LIBRARY_PATH=$CONDA_PREFIX/lib:$LIBRARY_PATH && "
-                        f"export CPATH=$CONDA_PREFIX/include:$CPATH && "
-                        f"export PKG_CONFIG_PATH=$CONDA_PREFIX/lib/pkgconfig:$PKG_CONFIG_PATH && "
+                        f"export LD_LIBRARY_PATH=${{CONDA_PREFIX:+$CONDA_PREFIX/lib:}}${{LD_LIBRARY_PATH:-}} && "
+                        f"export LIBRARY_PATH=${{CONDA_PREFIX:+$CONDA_PREFIX/lib:}}${{LIBRARY_PATH:-}} && "
+                        f"export CPATH=${{CONDA_PREFIX:+$CONDA_PREFIX/include:}}${{CPATH:-}} && "
+                        f"export PKG_CONFIG_PATH=${{CONDA_PREFIX:+$CONDA_PREFIX/lib/pkgconfig:}}${{PKG_CONFIG_PATH:-}} && "
                         f"export SLURM_JOB_ID={os.environ.get('SLURM_JOB_ID')} && "
                         f"export PHYSICS_CRITIC_ENABLED={os.environ.get('PHYSICS_CRITIC_ENABLED', 'true')} && "
                         f"export SEMANTIC_CRITIC_ENABLED={os.environ.get('SEMANTIC_CRITIC_ENABLED', 'true')} && "
                         f"{sage_exports}"
-                        f"python {abs_script_path}"
-                    )
-                    bash_command = (
-                        f"/home/gaok/anaconda3/bin/conda run -n {shlex.quote(conda_env_name)} "
-                        f"--no-capture-output bash -c {shlex.quote(server_command)}"
+                        f"{shlex.quote(server_python)} {shlex.quote(abs_script_path)}"
                     )
                     
                     command = "bash"
-                    args = ["-c", bash_command]
+                    args = ["-c", server_command]
                 else:
                     # Use node for JavaScript scripts
                     command = "node"
@@ -808,7 +807,7 @@ class MCPClientOAI:
                 server_params = StdioServerParameters(
                     command=command,
                     args=args,
-                    env=None
+                    env=os.environ.copy(),
                 )
 
                 print(f"🔌 Connecting to {server_name} with command: {command} {args}")

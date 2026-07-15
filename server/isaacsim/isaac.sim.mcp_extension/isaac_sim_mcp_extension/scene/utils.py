@@ -845,7 +845,7 @@ def get_window_unique_id(room: Room, window: Window) -> str:
     
 
 
-def export_layout_to_mesh_dict_list(layout: FloorPlan):
+def export_layout_to_mesh_dict_list(layout: FloorPlan, layout_save_dir=None):
     """
     Export a FloorPlan object to a mesh file using trimesh.
     Creates gray boxes for walls/floors, red boxes for doors, blue boxes for windows,
@@ -860,7 +860,8 @@ def export_layout_to_mesh_dict_list(layout: FloorPlan):
     import pickle
     # from constants import SERVER_ROOT_DIR
 
-    layout_save_dir = os.path.join(SERVER_ROOT_DIR, "results/")
+    if layout_save_dir is None:
+        layout_save_dir = os.path.join(SERVER_ROOT_DIR, "results/")
     
     def get_object_mesh(source, source_id, layout_id):
         object_save_path = f"{layout_save_dir}/{layout_id}/{source}/{source_id}.ply"
@@ -1128,7 +1129,7 @@ def export_layout_to_mesh_dict_list(layout: FloorPlan):
     return mesh_info_dict
 
 
-def export_layout_to_mesh_dict_list_no_object_transform(layout: FloorPlan):
+def export_layout_to_mesh_dict_list_no_object_transform(layout: FloorPlan, layout_save_dir=None):
     """
     Export a FloorPlan object to a mesh file using trimesh.
     Creates gray boxes for walls/floors, red boxes for doors, blue boxes for windows,
@@ -1143,7 +1144,8 @@ def export_layout_to_mesh_dict_list_no_object_transform(layout: FloorPlan):
     import pickle
     # from constants import SERVER_ROOT_DIR
 
-    layout_save_dir = os.path.join(SERVER_ROOT_DIR, "results/")
+    if layout_save_dir is None:
+        layout_save_dir = os.path.join(SERVER_ROOT_DIR, "results/")
     
     def get_object_mesh(source, source_id, layout_id):
         object_save_path = f"{layout_save_dir}/{layout_id}/{source}/{source_id}.ply"
@@ -1547,7 +1549,7 @@ def _simple_planar_uv_mapping(mesh: trimesh.Trimesh) -> dict:
     }
 
 
-def export_single_room_layout_to_mesh_dict_list(layout: FloorPlan, room_id: str):
+def export_single_room_layout_to_mesh_dict_list(layout: FloorPlan, room_id: str, layout_save_dir=None):
     """
     Export a FloorPlan object to a mesh file using trimesh.
     Creates gray boxes for walls/floors, red boxes for doors, blue boxes for windows,
@@ -1561,7 +1563,8 @@ def export_single_room_layout_to_mesh_dict_list(layout: FloorPlan, room_id: str)
     import pickle
     # from constants import SERVER_ROOT_DIR
     
-    layout_save_dir = os.path.join(SERVER_ROOT_DIR, "results/")
+    if layout_save_dir is None:
+        layout_save_dir = os.path.join(SERVER_ROOT_DIR, "results/")
 
     def get_object_mesh(source, source_id, layout_id):
         object_save_path = f"{layout_save_dir}/{layout_id}/{source}/{source_id}.ply"
@@ -1870,7 +1873,7 @@ def export_single_room_layout_to_mesh_dict_list(layout: FloorPlan, room_id: str)
     return mesh_info_dict
 
 
-def export_single_room_layout_to_mesh_dict_list_from_room(room: Room, layout_id: str):
+def export_single_room_layout_to_mesh_dict_list_from_room(room: Room, layout_id: str, layout_save_dir=None):
     """
     Export a FloorPlan object to a mesh file using trimesh.
     Creates gray boxes for walls/floors, red boxes for doors, blue boxes for windows,
@@ -1884,7 +1887,8 @@ def export_single_room_layout_to_mesh_dict_list_from_room(room: Room, layout_id:
     import pickle
     # from constants import SERVER_ROOT_DIR
 
-    layout_save_dir = os.path.join(SERVER_ROOT_DIR, "results/")
+    if layout_save_dir is None:
+        layout_save_dir = os.path.join(SERVER_ROOT_DIR, "results/")
 
     def get_object_mesh(source, source_id, layout_id):
         object_save_path = f"{layout_save_dir}/{layout_id}/{source}/{source_id}.ply"

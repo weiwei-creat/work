@@ -3019,6 +3019,25 @@ async def export_full_scene() -> str:
         summary["full_preview"] = f"error: {e}"
         print(f"Whole-layout preview render failed (non-fatal): {e}", file=sys.stderr)
 
+    # render_layout_preview rebuilds the integrated stage containing every room.
+    # Persist that stage as a single USD as well as the portable USD collection;
+    # batch consumers (including the submission container) require one scene file.
+    combined_usd_path = os.path.join(output_path, f"{current_layout.id}.usd")
+    try:
+        usd_result = get_room_layout_scene_usd(output_path, combined_usd_path)
+        usd_status = usd_result.get("status") if isinstance(usd_result, dict) else "unknown"
+        summary["combined_usd"] = {
+            "path": combined_usd_path,
+            "status": usd_status,
+        }
+        print(f"Combined whole-scene USD exported: {combined_usd_path} ({usd_status})", file=sys.stderr)
+    except Exception as e:
+        summary["combined_usd"] = {
+            "path": combined_usd_path,
+            "status": f"error: {e}",
+        }
+        print(f"Combined whole-scene USD export failed (non-fatal): {e}", file=sys.stderr)
+
     print(f"[TIMING] export_full_scene took {time.time()-_t0:.1f}s", file=sys.stderr)
     summary["message"] = "Whole-scene export finished. The scene generation task is complete."
     return json.dumps(summary)

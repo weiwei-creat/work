@@ -812,32 +812,29 @@ class MCPClientOAI:
 
             try:
                 if is_python:
-                    # Run Python scripts with conda environment and required env vars
+                    # Use the active interpreter unless explicitly overridden. This is
+                    # portable across conda installations and container images.
                     import os
                     import shlex
                     abs_script_path = os.path.abspath(server_script_path)
-                    conda_env_name = os.environ.get("CONDA_ENV_NAME", "sage")
+                    server_python = os.environ.get("SAGE_SERVER_PYTHON", sys.executable)
                     
                     # Create a bash command that sets up conda env and runs the script
                     server_command = (
                         f"cd {SERVER_DIR} && "
-                        f"export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH && "
-                        f"export LIBRARY_PATH=$CONDA_PREFIX/lib:$LIBRARY_PATH && "
-                        f"export CPATH=$CONDA_PREFIX/include:$CPATH && "
-                        f"export PKG_CONFIG_PATH=$CONDA_PREFIX/lib/pkgconfig:$PKG_CONFIG_PATH && "
+                        f"export LD_LIBRARY_PATH=${{CONDA_PREFIX:+$CONDA_PREFIX/lib:}}${{LD_LIBRARY_PATH:-}} && "
+                        f"export LIBRARY_PATH=${{CONDA_PREFIX:+$CONDA_PREFIX/lib:}}${{LIBRARY_PATH:-}} && "
+                        f"export CPATH=${{CONDA_PREFIX:+$CONDA_PREFIX/include:}}${{CPATH:-}} && "
+                        f"export PKG_CONFIG_PATH=${{CONDA_PREFIX:+$CONDA_PREFIX/lib/pkgconfig:}}${{PKG_CONFIG_PATH:-}} && "
                         f"export SLURM_JOB_ID={os.environ.get('SLURM_JOB_ID')} && "
                         f"export PHYSICS_CRITIC_ENABLED={os.environ.get('PHYSICS_CRITIC_ENABLED', 'true')} && "
                         f"export SEMANTIC_CRITIC_ENABLED={os.environ.get('SEMANTIC_CRITIC_ENABLED', 'true')} && "
                         f"export SLURM_JOB_ID={os.environ.get('SLURM_JOB_ID')} && "
-                        f"python {abs_script_path}"
-                    )
-                    bash_command = (
-                        f"/home/gaok/anaconda3/bin/conda run -n {shlex.quote(conda_env_name)} "
-                        f"--no-capture-output bash -c {shlex.quote(server_command)}"
+                        f"{shlex.quote(server_python)} {shlex.quote(abs_script_path)}"
                     )
                     
                     command = "bash"
-                    args = ["-c", bash_command]
+                    args = ["-c", server_command]
                 else:
                     # Use node for JavaScript scripts
                     command = "node"
@@ -846,7 +843,7 @@ class MCPClientOAI:
                 server_params = StdioServerParameters(
                     command=command,
                     args=args,
-                    env=None
+                    env=os.environ.copy(),
                 )
 
                 print(f"🔌 Connecting to {server_name} with command: {command} {args}")

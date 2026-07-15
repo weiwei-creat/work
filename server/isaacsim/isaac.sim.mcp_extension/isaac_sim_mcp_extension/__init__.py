@@ -36,5 +36,16 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 """
 
+import os
+import sys
+
+
+# Kit's extension importer builds an isolated sys.path and may not retain the
+# trailing conda entry from PYTHONPATH. Add the explicitly selected portable
+# dependency directory before importing the SAGE extension implementation.
+_conda_site_packages = os.environ.get("SAGE_CONDA_SITE_PACKAGES")
+if _conda_site_packages and _conda_site_packages not in sys.path:
+    sys.path.append(_conda_site_packages)
+
 from .extension import MCPExtension
 __all__ = ["MCPExtension"]

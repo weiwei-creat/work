@@ -29,7 +29,22 @@ OBJATHOR_ASSETS_BASE_DIR = os.environ.get(
     "OBJATHOR_ASSETS_BASE_DIR", os.path.expanduser(f"~/.objathor-assets")
 )
 
-HOLODECK_BASE_DATA_DIR = os.path.join(OBJATHOR_ASSETS_BASE_DIR, "holodeck", ASSETS_VERSION)
+_REPO_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "objathor")
+)
+_OBJATHOR_ROOT = os.path.abspath(
+    os.environ.get("SAGE_OBJATHOR_ROOT", _REPO_ROOT)
+)
+_REPO_OBJATHOR_DIR = os.path.join(_OBJATHOR_ROOT, ASSETS_VERSION)
+_STANDARD_HOLODECK_DIR = os.path.join(
+    OBJATHOR_ASSETS_BASE_DIR, "holodeck", ASSETS_VERSION
+)
+HOLODECK_BASE_DATA_DIR = os.environ.get(
+    "HOLODECK_BASE_DATA_DIR",
+    _STANDARD_HOLODECK_DIR
+    if os.path.isdir(_STANDARD_HOLODECK_DIR)
+    else _REPO_OBJATHOR_DIR,
+)
 
 
 class MaterialSelector:

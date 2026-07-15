@@ -281,10 +281,26 @@ def get_port():
         port = int(override)
         print(f"Isaacsim MCP server port: {port}", file=sys.stderr)
         return port
+    endpoint = os.environ.get("ISAAC_SIM_URL", "").strip()
+    if endpoint:
+        parsed = urlparse(endpoint if "://" in endpoint else f"tcp://{endpoint}")
+        if parsed.port:
+            print(f"Isaacsim MCP server port from ISAAC_SIM_URL: {parsed.port}", file=sys.stderr)
+            return parsed.port
     slurm_job_id = os.environ.get("SLURM_JOB_ID")
     port = slurm_job_id_to_port(slurm_job_id)
     print(f"Isaacsim MCP server port: {port}", file=sys.stderr)
     return port
+
+
+def get_host():
+    """Resolve the external Isaac socket host for local and container runs."""
+    endpoint = os.environ.get("ISAAC_SIM_URL", "").strip()
+    if endpoint:
+        parsed = urlparse(endpoint if "://" in endpoint else f"tcp://{endpoint}")
+        if parsed.hostname:
+            return parsed.hostname
+    return os.environ.get("SAGE_ISAAC_HOST", "localhost")
 
 def get_isaac_connection():
     """Get or create a persistent Isaac connection"""
@@ -306,7 +322,7 @@ def get_isaac_connection():
     
     # Create a new connection if needed
     if _isaac_connection is None:
-        _isaac_connection = IsaacConnection(host="localhost", port=get_port())
+        _isaac_connection = IsaacConnection(host=get_host(), port=get_port())
         if not _isaac_connection.connect():
             logger.error("Failed to connect to Isaac")
             _isaac_connection = None
@@ -578,7 +594,11 @@ def get_room_layout_scene_usd(scene_save_dir: str, usd_file_path: str) -> str:
         return result
     except Exception as e:
         logger.error(f"Error get_room_layout_scene_usd: {str(e)}")
-        return f'error: {"status": "error", "error": str(e), "message": "Error get_room_layout_scene_usd"}'
+        return {
+            "status": "error",
+            "error": str(e),
+            "message": "Error get_room_layout_scene_usd",
+        }
 
 def render_room_preview(scene_save_dir: str, room_id: str, resolution: int = 1024, num_views: int = 4) -> str:
     """
@@ -630,7 +650,11 @@ def get_room_layout_scene_usd_separate(scene_save_dir: str, usd_collection_dir: 
         return result
     except Exception as e:
         logger.error(f"Error get_room_layout_scene_usd_separate: {str(e)}")
-        return f'error: {"status": "error", "error": str(e), "message": "Error get_room_layout_scene_usd_separate"}'
+        return {
+            "status": "error",
+            "error": str(e),
+            "message": "Error get_room_layout_scene_usd_separate",
+        }
 
 def get_room_layout_scene_usd_separate_from_layout(layout_json_path: str, usd_collection_dir: str) -> str:
     """
@@ -642,7 +666,11 @@ def get_room_layout_scene_usd_separate_from_layout(layout_json_path: str, usd_co
         return result
     except Exception as e:
         logger.error(f"Error get_room_layout_scene_usd_separate: {str(e)}")
-        return f'error: {"status": "error", "error": str(e), "message": "Error get_room_layout_scene_usd_separate"}'
+        return {
+            "status": "error",
+            "error": str(e),
+            "message": "Error get_room_layout_scene_usd_separate",
+        }
 
 
 def simulate_the_scene() -> str:

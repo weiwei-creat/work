@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
+
 from sentence_transformers import SentenceTransformer
 import open_clip
 
@@ -34,8 +36,18 @@ def init_clip():
 
 def init_sbert():
     # initialize sentence transformer
-    print("loading sbert_model")
-    sbert_model = SentenceTransformer("all-mpnet-base-v2", device="cpu")
+    configured_model = os.environ.get("SAGE_SBERT_MODEL")
+    local_candidates = [
+        configured_model,
+        "/models/all-mpnet-base-v2",
+        os.path.expanduser("~/models/all-mpnet-base-v2"),
+    ]
+    model_source = next(
+        (path for path in local_candidates if path and os.path.isdir(path)),
+        configured_model or "all-mpnet-base-v2",
+    )
+    print(f"loading sbert_model from {model_source}")
+    sbert_model = SentenceTransformer(model_source, device="cpu")
     print("loaded sbert_model")
     return sbert_model
 

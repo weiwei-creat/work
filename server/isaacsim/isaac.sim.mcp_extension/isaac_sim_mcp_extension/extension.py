@@ -187,7 +187,11 @@ class MCPExtension(omni.ext.IExt):
         print("trigger  on_startup for: ", ext_id)
         print("settings: ", self._settings.get("/exts/omni.kit.pipapi"))
         self.port = self.get_port()
-        self.host = "localhost"
+        # Keep loopback as the secure default. Deployments where the one-shot
+        # job container runs in a separate network namespace may explicitly
+        # bind the Isaac-side socket to a reachable interface.
+        self.host = os.environ.get("SAGE_ISAAC_BIND_HOST", "localhost")
+        self._main_asyncio_loop = asyncio.get_event_loop()
         if not hasattr(self, 'running'):
             self.running = False
 
@@ -346,6 +350,17 @@ class MCPExtension(omni.ext.IExt):
             print("Client handler stopped")
 
     def _submit_command(self, command):
+        # Isaac Sim 4.5 does not reliably deliver the update-event
+        # subscription used by the original 5.1 implementation after a
+        # command arrives on the socket thread. Submit directly to the Kit
+        # main asyncio loop; USD and Replicator handlers still execute on the
+        # main thread.
+        if self._main_asyncio_loop and self._main_asyncio_loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(
+                self._execute_command_on_main(command), self._main_asyncio_loop
+            )
+            return future.result(timeout=600)
+
         request = {
             "command": command,
             "event": threading.Event(),
@@ -357,6 +372,12 @@ class MCPExtension(omni.ext.IExt):
         if not request["event"].is_set():
             return {"status": "error", "message": "Isaac MCP server stopped before command completed"}
         return request["response"]
+
+    async def _execute_command_on_main(self, command):
+        response = self.execute_command(command)
+        if inspect.isawaitable(response):
+            response = await response
+        return response
 
     def _process_command_queue(self, event=None):
         if self._command_processing:
@@ -634,7 +655,9 @@ class MCPExtension(omni.ext.IExt):
             floor_plan = dict_to_floor_plan(layout_data)
             current_layout = floor_plan
             
-            mesh_info_dict = export_layout_to_mesh_dict_list(current_layout)
+            mesh_info_dict = export_layout_to_mesh_dict_list(
+                current_layout, os.path.dirname(scene_save_dir)
+            )
 
             stage = Usd.Stage.CreateInMemory()
 
@@ -752,7 +775,9 @@ class MCPExtension(omni.ext.IExt):
             floor_plan = dict_to_floor_plan(layout_data)
             current_layout = floor_plan
             
-            mesh_info_dict = export_single_room_layout_to_mesh_dict_list(current_layout, room_id)
+            mesh_info_dict = export_single_room_layout_to_mesh_dict_list(
+                current_layout, room_id, os.path.dirname(scene_save_dir)
+            )
 
             stage = Usd.Stage.CreateInMemory()
 
@@ -870,7 +895,9 @@ class MCPExtension(omni.ext.IExt):
             
             room = dict_to_room(room_data)
             
-            mesh_info_dict = export_single_room_layout_to_mesh_dict_list_from_room(room, layout_id)
+            mesh_info_dict = export_single_room_layout_to_mesh_dict_list_from_room(
+                room, layout_id, os.path.dirname(scene_save_dir)
+            )
 
             stage = Usd.Stage.CreateInMemory()
 
@@ -989,7 +1016,9 @@ class MCPExtension(omni.ext.IExt):
                     room_data = json.load(f)
                 room = dict_to_room(room_data)
                 group_id = os.path.splitext(os.path.basename(room_dict_save_path))[0]
-                mesh_info_dict = export_single_room_layout_to_mesh_dict_list_from_room(room, layout_id)
+                mesh_info_dict = export_single_room_layout_to_mesh_dict_list_from_room(
+                    room, layout_id, os.path.dirname(scene_save_dir)
+                )
                 mesh_info_dict_groups[group_id] = mesh_info_dict
 
                 room_corner_x, room_corner_y = room.position.x, room.position.y
@@ -1097,7 +1126,9 @@ class MCPExtension(omni.ext.IExt):
             scene_save_dir = os.path.dirname(room_dict_save_path)
             layout_id = os.path.basename(scene_save_dir)
             
-            room_mesh_info_dict = export_single_room_layout_to_mesh_dict_list_from_room(target_room, layout_id)
+            room_mesh_info_dict = export_single_room_layout_to_mesh_dict_list_from_room(
+                target_room, layout_id, os.path.dirname(scene_save_dir)
+            )
             collision_approximation = DEFAULT_COLLISION_APPROXIMATION
             # load placements info
             with open(placements_info_path, 'r') as f:
@@ -1389,7 +1420,9 @@ class MCPExtension(omni.ext.IExt):
             floor_plan = dict_to_floor_plan(layout_data)
             current_layout = floor_plan
             
-            mesh_info_dict = export_layout_to_mesh_dict_list(current_layout)
+            mesh_info_dict = export_layout_to_mesh_dict_list(
+                current_layout, os.path.dirname(scene_save_dir)
+            )
 
             stage = self._create_fresh_usd_stage(usd_file_path)
 
@@ -1602,7 +1635,9 @@ class MCPExtension(omni.ext.IExt):
             floor_plan = dict_to_floor_plan(layout_data)
             current_layout = floor_plan
             
-            mesh_info_dict = export_layout_to_mesh_dict_list(current_layout)
+            mesh_info_dict = export_layout_to_mesh_dict_list(
+                current_layout, os.path.dirname(scene_save_dir)
+            )
             rigid_object_property_dict = {}
             rigid_object_transform_dict = {}
 
@@ -1687,7 +1722,9 @@ class MCPExtension(omni.ext.IExt):
             floor_plan = dict_to_floor_plan(layout_data)
             current_layout = floor_plan
             
-            mesh_info_dict = export_layout_to_mesh_dict_list_no_object_transform(current_layout)
+            mesh_info_dict = export_layout_to_mesh_dict_list_no_object_transform(
+                current_layout, os.path.dirname(os.path.dirname(layout_json_path))
+            )
 
             rigid_object_property_dict = {}
             rigid_object_transform_dict = {}
@@ -2008,7 +2045,20 @@ Suggestions:
                 writer.attach([render_product])
 
                 rt_subframes = int(os.environ.get("SAGE_RT_SUBFRAMES", "4"))
-                await rep.orchestrator.step_async(rt_subframes=rt_subframes, pause_timeline=True, wait_for_render=True)
+                try:
+                    await rep.orchestrator.step_async(
+                        rt_subframes=rt_subframes,
+                        pause_timeline=True,
+                        wait_for_render=True,
+                    )
+                except TypeError as exc:
+                    # Isaac Sim 4.5 does not expose wait_for_render yet.
+                    if "wait_for_render" not in str(exc):
+                        raise
+                    await rep.orchestrator.step_async(
+                        rt_subframes=rt_subframes,
+                        pause_timeline=True,
+                    )
                 await rep.orchestrator.wait_until_complete_async()
                 writer.detach()
 
@@ -2132,7 +2182,20 @@ Suggestions:
                 writer.attach([render_product])
 
                 rt_subframes = int(os.environ.get("SAGE_RT_SUBFRAMES", "4"))
-                await rep.orchestrator.step_async(rt_subframes=rt_subframes, pause_timeline=True, wait_for_render=True)
+                try:
+                    await rep.orchestrator.step_async(
+                        rt_subframes=rt_subframes,
+                        pause_timeline=True,
+                        wait_for_render=True,
+                    )
+                except TypeError as exc:
+                    # Isaac Sim 4.5 does not expose wait_for_render yet.
+                    if "wait_for_render" not in str(exc):
+                        raise
+                    await rep.orchestrator.step_async(
+                        rt_subframes=rt_subframes,
+                        pause_timeline=True,
+                    )
                 await rep.orchestrator.wait_until_complete_async()
                 writer.detach()
 

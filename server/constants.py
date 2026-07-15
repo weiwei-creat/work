@@ -15,7 +15,9 @@
 import os
 import sys
 SERVER_ROOT_DIR = os.path.dirname(__file__)
-RESULTS_DIR = os.path.join(SERVER_ROOT_DIR, "results")
+RESULTS_DIR = os.path.abspath(
+    os.environ.get("SAGE_RESULTS_DIR", os.path.join(SERVER_ROOT_DIR, "results"))
+)
 
 ROBOMIMIC_ROOT_DIR = os.path.join(SERVER_ROOT_DIR, "../robomimic")
 M2T2_ROOT_DIR = os.path.join(SERVER_ROOT_DIR, "../M2T2")

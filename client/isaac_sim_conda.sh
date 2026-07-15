@@ -9,6 +9,12 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SAGE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+# Explicit launch-time values must win over machine-specific entries copied in
+# from an older .env file.
+_EXPLICIT_ISAAC_SIM_PATH="${ISAAC_SIM_PATH:-}"
+_EXPLICIT_CONDA_PYTHON="${CONDA_PYTHON:-}"
+_EXPLICIT_CONDA_ENV_NAME="${CONDA_ENV_NAME:-}"
+
 if [ -f "${SAGE_ROOT}/.env" ]; then
     set -a
     # shellcheck disable=SC1091
@@ -16,11 +22,15 @@ if [ -f "${SAGE_ROOT}/.env" ]; then
     set +a
 fi
 
+[ -n "${_EXPLICIT_ISAAC_SIM_PATH}" ] && ISAAC_SIM_PATH="${_EXPLICIT_ISAAC_SIM_PATH}"
+[ -n "${_EXPLICIT_CONDA_PYTHON}" ] && CONDA_PYTHON="${_EXPLICIT_CONDA_PYTHON}"
+[ -n "${_EXPLICIT_CONDA_ENV_NAME}" ] && CONDA_ENV_NAME="${_EXPLICIT_CONDA_ENV_NAME}"
+
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-sage}"
-ISAACSIM_PATH="${ISAAC_SIM_PATH:-/home/gaok/coding/isaacsim}"
+ISAACSIM_PATH="${ISAAC_SIM_PATH:-/home/ubuntu/isaac}"
 ISAACLAB_PATH="${ISAACLAB_PATH:-${SAGE_ROOT}/IsaacLab}"
 RELEASE_ROOT="${ISAACSIM_PATH}/_build/linux-x86_64/release"
-CONDA_ENV_PYTHON="${CONDA_PYTHON:-/home/gaok/anaconda3/envs/${CONDA_ENV_NAME}/bin/python}"
+CONDA_ENV_PYTHON="${CONDA_PYTHON:-${CONDA_PREFIX:+${CONDA_PREFIX}/bin/python}}"
 
 echo "[INFO] Starting Isaac Sim with conda environment '${CONDA_ENV_NAME}'..."
 if [ -x "${CONDA_ENV_PYTHON}" ]; then
@@ -97,7 +107,12 @@ if [ -x "${ISAACSIM_PATH}/kit/kit" ]; then
             ISAAC_PYTHON_PATHS="${ISAAC_PYTHON_PATHS}:${pip_prebundle_dir}"
         fi
     done
-    export PYTHONPATH="${ISAAC_PYTHON_PATHS}:${PYTHONPATH:-}"
+    # Binary Isaac Sim 4.5 and the sage environment both use Python 3.10.
+    # Keep Kit's bundled modules first, then expose portable dependencies used
+    # by the SAGE extension (xatlas, trimesh, scipy, imageio, ...).
+    CONDA_SITE_PACKAGES="$("${PYTHON_EXE}" -c 'import site; print(site.getsitepackages()[0])')"
+    export SAGE_CONDA_SITE_PACKAGES="${CONDA_SITE_PACKAGES}"
+    export PYTHONPATH="${ISAAC_PYTHON_PATHS}:${PYTHONPATH:-}:${CONDA_SITE_PACKAGES}"
 
     ISAAC_LIB_PATHS="${ISAACSIM_PATH}:${ISAACSIM_PATH}/kit:${ISAACSIM_PATH}/kit/kernel/plugins"
     ISAAC_LIB_PATHS="${ISAAC_LIB_PATHS}:${ISAACSIM_PATH}/kit/libs/iray:${ISAACSIM_PATH}/kit/plugins"

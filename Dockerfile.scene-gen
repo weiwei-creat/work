@@ -1,0 +1,50 @@
+FROM python:3.10-slim-bookworm
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    CUDA_VISIBLE_DEVICES="" \
+    SAGE_ROOT=/app \
+    SAGE_SHARED_ROOT=/shared \
+    SAGE_DISABLE_TRELLIS=1 \
+    SAGE_DISABLE_MATFUSE=1
+
+RUN sed -i \
+        -e 's|http://deb.debian.org/debian|http://mirrors.tuna.tsinghua.edu.cn/debian|g' \
+        -e 's|http://deb.debian.org/debian-security|http://mirrors.tuna.tsinghua.edu.cn/debian-security|g' \
+        /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        build-essential git libegl1 libgl1 libglib2.0-0 libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY client/environment.yml /app/client/environment.yml
+
+# The job container does not render and does not require a GPU. Install CPU
+# PyTorch first, then the portable portion of the exported SAGE environment.
+RUN python -m pip install --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+        pip==25.2 setuptools==78.1.1 wheel==0.45.1 \
+    && python -m pip install --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+        "https://mirrors.aliyun.com/pytorch-wheels/cpu/torch-2.5.1%2Bcpu-cp310-cp310-linux_x86_64.whl" \
+        "https://mirrors.aliyun.com/pytorch-wheels/cpu/torchvision-0.20.1%2Bcpu-cp310-cp310-linux_x86_64.whl" \
+        "https://mirrors.aliyun.com/pytorch-wheels/cpu/torchaudio-2.5.1%2Bcpu-cp310-cp310-linux_x86_64.whl" \
+    && awk '/^  - pip:$/ {p=1; next} p && /^      - / { \
+          sub(/^      - /, ""); \
+          if ($0 !~ /^(torch|torchvision|torchaudio)==/ && \
+              $0 !~ /^nvidia-/ && \
+              $0 !~ /^omni-isaac-lab/ && \
+              $0 !~ /^pytorch3d==/ && \
+              $0 !~ /^nvdiffrast==/ && \
+              $0 !~ /^egl-probe==/ && \
+              $0 !~ /^evdev==/ && \
+              $0 !~ /^pynput==/ && \
+              $0 !~ /^triton==/ && \
+              $0 !~ /^nvidia-curobo==/) print \
+        }' client/environment.yml > /tmp/requirements-sage.txt \
+    && python -m pip install --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+        -r /tmp/requirements-sage.txt \
+    && rm -f /tmp/requirements-sage.txt
+
+COPY . /app
+
+ENTRYPOINT ["python", "/app/docker/scene_entrypoint.py"]
