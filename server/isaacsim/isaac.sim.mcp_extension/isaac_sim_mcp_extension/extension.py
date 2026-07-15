@@ -442,6 +442,7 @@ class MCPExtension(omni.ext.IExt):
             "create_single_room_layout_scene_from_room": self.create_single_room_layout_scene_from_room,
             "get_room_layout_scene_usd": self.get_room_layout_scene_usd,
             "render_room_preview": self.render_room_preview,
+            "render_layout_preview": self.render_layout_preview,
             "simulate_the_scene": self.simulate_the_scene,
             "test_object_placements_in_single_room": self.test_object_placements_in_single_room,
             "get_room_layout_scene_usd_separate": self.get_room_layout_scene_usd_separate,
@@ -710,7 +711,9 @@ class MCPExtension(omni.ext.IExt):
             # Set the world axis of the stage root layer to Z
             UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
 
-            usd_file_path = self._export_stage_snapshot(stage, scene_save_dir, room_id)
+            # Snapshot the whole layout under the layout id (`room_id` doesn't
+            # exist here — this builds ALL rooms, not one).
+            usd_file_path = self._export_stage_snapshot(stage, scene_save_dir, current_layout_id)
 
             return {
                 "status": "success",
@@ -725,7 +728,7 @@ class MCPExtension(omni.ext.IExt):
                 "status": "error",
                 "message": str(e)
             }
-        
+
     def create_single_room_layout_scene(self, scene_save_dir: str, room_id: str):
         """
         Create a room layout scene from a dictionary of mesh information.
@@ -1938,7 +1941,10 @@ Suggestions:
         """
         Render room preview images from the current Isaac Sim stage using Replicator.
         """
+        _render_t0 = time.time()
         try:
+            _rt_subframes_dbg = os.environ.get("SAGE_RT_SUBFRAMES", "4")
+            print(f"[TIMING] render_room_preview START room={room_id} views={num_views} res={resolution} rt_subframes={_rt_subframes_dbg}", file=sys.stderr)
             stage = omni.usd.get_context().get_stage()
             if stage is None:
                 return {"status": "error", "message": "No active stage to render"}
@@ -2001,7 +2007,8 @@ Suggestions:
                 writer.initialize(output_dir=view_dir, rgb=True, image_output_format="png", frame_padding=4)
                 writer.attach([render_product])
 
-                await rep.orchestrator.step_async(rt_subframes=16, pause_timeline=True, wait_for_render=True)
+                rt_subframes = int(os.environ.get("SAGE_RT_SUBFRAMES", "4"))
+                await rep.orchestrator.step_async(rt_subframes=rt_subframes, pause_timeline=True, wait_for_render=True)
                 await rep.orchestrator.wait_until_complete_async()
                 writer.detach()
 
@@ -2022,6 +2029,7 @@ Suggestions:
                     }
                 rendered_paths.append(final_path)
 
+            print(f"[TIMING] render_room_preview DONE room={room_id} views={len(rendered_paths)} took {time.time()-_render_t0:.1f}s", file=sys.stderr)
             return {
                 "status": "success",
                 "message": f"Rendered {len(rendered_paths)} Isaac preview images",
@@ -2035,6 +2043,161 @@ Suggestions:
                 "status": "error",
                 "message": str(e)
             }
+
+    async def render_layout_preview(self, scene_save_dir: str, resolution: int = 1024, num_views: int = 4):
+        """
+        Render whole-layout preview images: rebuild the FULL floor-plan stage (all
+        rooms, walls with door openings, doors + every object in global coordinates)
+        and shoot a top-down overview plus oblique corner views, so multi-room
+        results read as one integrated building instead of per-room boxes.
+        """
+        _render_t0 = time.time()
+        try:
+            current_layout_id = os.path.basename(scene_save_dir)
+            json_file_path = os.path.join(scene_save_dir, f"{current_layout_id}.json")
+            with open(json_file_path, "r") as f:
+                layout_data = json.load(f)
+            rooms = layout_data.get("rooms", [])
+            if not rooms:
+                return {"status": "error", "message": "Layout has no rooms"}
+
+            print(f"[TIMING] render_layout_preview START layout={current_layout_id} rooms={len(rooms)} views={num_views} res={resolution}", file=sys.stderr)
+
+            build_result = self.create_room_layout_scene(scene_save_dir)
+            if not isinstance(build_result, dict) or build_result.get("status") != "success":
+                return {"status": "error", "message": f"Failed to build full layout stage: {build_result}"}
+
+            # Let the freshly attached stage settle before Replicator touches it.
+            app = omni.kit.app.get_app()
+            for _ in range(8):
+                await app.next_update_async()
+
+            stage = omni.usd.get_context().get_stage()
+            if stage is None:
+                return {"status": "error", "message": "No active stage to render"}
+
+            min_x = min(float(r["position"]["x"]) for r in rooms)
+            min_y = min(float(r["position"]["y"]) for r in rooms)
+            max_x = max(float(r["position"]["x"]) + float(r["dimensions"]["width"]) for r in rooms)
+            max_y = max(float(r["position"]["y"]) + float(r["dimensions"]["length"]) for r in rooms)
+            max_h = max(float(r["dimensions"]["height"]) for r in rooms)
+            span = max(max_x - min_x, max_y - min_y)
+            center = np.array([(min_x + max_x) / 2.0, (min_y + max_y) / 2.0, 0.0], dtype=float)
+            lookat = center + np.array([0.0, 0.0, max_h * 0.2], dtype=float)
+
+            self._prepare_layout_preview_stage(stage, center, max_h)
+
+            # Snapshot a viewer-ready USD with the preview lights and hidden
+            # ceilings baked in, so GUI display (scene_viewer.py) is lit and
+            # shows the interior without further setup.
+            try:
+                self._export_stage_snapshot(stage, scene_save_dir, f"{current_layout_id}_view")
+            except Exception as view_exc:
+                print(f"view USD snapshot failed (non-fatal): {view_exc}", file=sys.stderr)
+
+            preview_dir = os.path.join(scene_save_dir, "preview")
+            os.makedirs(preview_dir, exist_ok=True)
+
+            import glob
+            import shutil
+            import omni.replicator.core as rep
+
+            # View 1: dollhouse top-down (ceilings hidden); rest: high corner obliques.
+            corner_z = span * 0.85 + max_h
+            camera_positions = [
+                np.array([center[0], center[1] - 0.01, span * 1.15 + max_h], dtype=float),
+                np.array([min_x - span * 0.25, min_y - span * 0.25, corner_z], dtype=float),
+                np.array([max_x + span * 0.25, min_y - span * 0.25, corner_z], dtype=float),
+                np.array([max_x + span * 0.25, max_y + span * 0.25, corner_z], dtype=float),
+                np.array([min_x - span * 0.25, max_y + span * 0.25, corner_z], dtype=float),
+            ][:max(1, int(num_views))]
+
+            rendered_paths = []
+            for i, camera_pos in enumerate(camera_positions):
+                view_dir = os.path.join(preview_dir, f"_isaac_full_view_{i + 1}")
+                if os.path.isdir(view_dir):
+                    shutil.rmtree(view_dir)
+                os.makedirs(view_dir, exist_ok=True)
+
+                camera = rep.create.camera(
+                    position=tuple(float(v) for v in camera_pos),
+                    look_at=tuple(float(v) for v in lookat),
+                    clipping_range=(0.01, 1000000.0),
+                    focal_length=20.0,
+                    name=f"SAGEFullPreviewCamera_{i + 1}",
+                )
+                render_product = rep.create.render_product(camera, (int(resolution), int(resolution)), force_new=True)
+                writer = rep.WriterRegistry.get("BasicWriter")
+                writer.initialize(output_dir=view_dir, rgb=True, image_output_format="png", frame_padding=4)
+                writer.attach([render_product])
+
+                rt_subframes = int(os.environ.get("SAGE_RT_SUBFRAMES", "4"))
+                await rep.orchestrator.step_async(rt_subframes=rt_subframes, pause_timeline=True, wait_for_render=True)
+                await rep.orchestrator.wait_until_complete_async()
+                writer.detach()
+
+                candidates = sorted(glob.glob(os.path.join(view_dir, "**", "rgb_*.png"), recursive=True))
+                if not candidates:
+                    candidates = sorted(glob.glob(os.path.join(view_dir, "**", "*.png"), recursive=True))
+                if not candidates:
+                    return {"status": "error", "message": f"Isaac render produced no PNG for full view {i + 1}"}
+
+                final_path = os.path.join(preview_dir, f"{current_layout_id}_full_view_{i + 1}.png")
+                shutil.copy2(candidates[-1], final_path)
+                validation_error = self._validate_preview_png(final_path)
+                if validation_error:
+                    return {
+                        "status": "error",
+                        "message": f"Isaac render produced an invalid full preview for view {i + 1}: {validation_error}",
+                        "preview_path": final_path,
+                    }
+                rendered_paths.append(final_path)
+
+            print(f"[TIMING] render_layout_preview DONE layout={current_layout_id} views={len(rendered_paths)} took {time.time()-_render_t0:.1f}s", file=sys.stderr)
+            return {
+                "status": "success",
+                "message": f"Rendered {len(rendered_paths)} whole-layout preview images",
+                "preview_paths": rendered_paths,
+            }
+
+        except Exception as e:
+            print(f"Error rendering the layout preview: {str(e)}")
+            traceback.print_exc()
+            return {
+                "status": "error",
+                "message": str(e)
+            }
+
+    def _prepare_layout_preview_stage(self, stage, layout_center: np.ndarray, max_height: float):
+        """Hide every room's ceiling (dollhouse view) and add deterministic preview lights."""
+        for prim in stage.Traverse():
+            path = prim.GetPath().pathString
+            if path.startswith("/World/floor_") and path.endswith("_ceiling"):
+                UsdGeom.Imageable(prim).MakeInvisible()
+
+        for path in [
+            "/World/SAGEPreviewDomeLight",
+            "/World/SAGEPreviewDistantLight",
+            "/World/SAGEPreviewRectLight",
+        ]:
+            if stage.GetPrimAtPath(path):
+                stage.RemovePrim(path)
+
+        dome = UsdLux.DomeLight.Define(stage, "/World/SAGEPreviewDomeLight")
+        dome.CreateIntensityAttr(650.0)
+        dome.CreateExposureAttr(0.0)
+
+        distant = UsdLux.DistantLight.Define(stage, "/World/SAGEPreviewDistantLight")
+        distant.CreateIntensityAttr(800.0)
+        distant.CreateAngleAttr(0.5)
+        distant.AddRotateXYZOp().Set(Gf.Vec3f(-55.0, 0.0, 35.0))
+
+        rect = UsdLux.RectLight.Define(stage, "/World/SAGEPreviewRectLight")
+        rect.CreateIntensityAttr(900.0)
+        rect.CreateWidthAttr(12.0)
+        rect.CreateHeightAttr(10.0)
+        rect.AddTranslateOp().Set(Gf.Vec3d(float(layout_center[0]), float(layout_center[1]), max_height + 1.5))
+        rect.AddRotateXYZOp().Set(Gf.Vec3f(-90.0, 0.0, 0.0))
 
     def _prepare_room_preview_stage(self, stage, room_id: str, room_center: np.ndarray, room_height: float):
         """Make the room visible to the preview cameras and add deterministic preview lights."""

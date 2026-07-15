@@ -43,3 +43,15 @@ python client_generation_robot_task.py \
     --task_description "In an office with a desk holding a coffee mug and document folder with an office chair in front, a bookshelf with a stapler against the wall, a filing cabinet with a tape dispenser positioned away from the desk and bookshelf, and a side table near the desk, the robot must pick up the coffee mug from the desk and place it on the side table." \
     --server_paths ../server/layout.py
 
+## Unitree G1 navigation (pure walking between floor landmarks, no manipulation):
+python client_generation_robot_task.py \
+    --room_type "living room" \
+    --robot_type "unitree g1" \
+    --task_description "A Unitree G1 humanoid must navigate from the center of a living room to a sofa against one wall, then walk to a bookshelf on the opposite side, and finally walk to a round coffee table, keeping a clear collision-free path between all landmarks." \
+    --server_paths ../server/layout.py
+
+# After generation, on the run machine, visualize G1 walking the planned route:
+#   export SAGE_LAYOUT_DIR=$(pwd)/../server/results/<layout_id>
+#   export SAGE_LAYOUT_ID=<layout_id>
+#   then run examples/g1_navigate_in_scene.py inside the Isaac Sim kit.
+

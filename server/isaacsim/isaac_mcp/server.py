@@ -600,6 +600,26 @@ def render_room_preview(scene_save_dir: str, room_id: str, resolution: int = 102
         logger.error(f"Error render_room_preview: {str(e)}")
         return {"status": "error", "error": str(e), "message": "Error render_room_preview"}
 
+def render_layout_preview(scene_save_dir: str, resolution: int = 1024, num_views: int = 4) -> str:
+    """
+    Render whole-layout preview PNGs (all rooms in one frame) by rebuilding the
+    full floor-plan stage in Isaac Sim.
+    """
+    try:
+        isaac = get_isaac_connection()
+        result = isaac.send_command(
+            "render_layout_preview",
+            {
+                "scene_save_dir": scene_save_dir,
+                "resolution": resolution,
+                "num_views": num_views,
+            },
+        )
+        return result
+    except Exception as e:
+        logger.error(f"Error render_layout_preview: {str(e)}")
+        return {"status": "error", "error": str(e), "message": "Error render_layout_preview"}
+
 def get_room_layout_scene_usd_separate(scene_save_dir: str, usd_collection_dir: str) -> str:
     """
     Get the USD file of the room layout scene.

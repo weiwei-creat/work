@@ -188,12 +188,31 @@ SOURCE 3: Failed Placements (Retry Logic)
 - If failures persist due to limited space, try smaller alternative objects
 - Do NOT give up after one failure
 
+SOURCE 4: Under-populated Surfaces (Density Driver)
+- The placement tool result may include an `underpopulated_surfaces` list: supporting
+  surfaces (tables, desks, shelves, counters, nightstands, etc.) that currently hold
+  fewer than the required number of small items.
+- [CRITICAL] Treat this list as a direct work-list: for EACH listed `supporter_id`,
+  place 2+ suitable small objects ON it (use the exact supporter_id as the placement
+  location) in a single grouped placement call (e.g. "place 3 books and 1 mug on
+  <supporter_id>, arranged neatly").
+- Keep placing until `underpopulated_surfaces` is empty — this is the main lever for
+  a rich, lived-in scene.
+
+NOTE ON ROLLBACK:
+- If a tool result contains a `rollback` field, your last placement was REVERTED
+  because it reduced room quality. Do NOT repeat the same placement — follow the
+  rollback `instruction` and try a different, more careful approach.
+
 --- 3.3 PLACEMENT CONSTRAINTS ---
 
 PER-CALL LIMITS:
-[CRITICAL] Maximum 35-40 objects per single placement call
-[CRITICAL] Maximum 10-12 object TYPES per single placement call
-[ENCOURAGED] Place multiple object types in a single call for efficiency
+[CRITICAL] Place at most 6-8 objects and at most 5-6 object TYPES per single placement call.
+[CRITICAL] Keep each tool call SHORT. Long placement calls cause the model to repeat
+  the same line over and over and fail to terminate — which silently aborts the whole
+  generation. If the room needs more objects, make SEVERAL small calls instead of one big one.
+[CRITICAL] NEVER repeat the same object entry within a single call.
+[ENCOURAGED] Place a few related object types together per call, then call again for the rest.
 
 TOTAL SCENE LIMITS:
 - NO maximum on total objects across all calls
@@ -477,9 +496,17 @@ class MCPClientOAI:
         self.total_tokens = 0
         self.api_call_count = 0
         
-        # Initialize tool call tracking
+        # Initialize tool call tracking.
+        # Raised from the old hard-coded 15 (which starved object density and
+        # sometimes barely reached the feasibility step). Configurable via
+        # SAGE_MAX_TOOL_CALLS so rich scenes can place far more objects.
         self.tool_call_count = 0
-        self.max_tool_calls = 15
+        self.max_tool_calls = int(os.environ.get("SAGE_MAX_TOOL_CALLS", "40"))
+        # Keep the N most recent tool results in full; older ones are compressed
+        # to a short head so the context stays bounded even with many tool calls
+        # (deterministic summarization — no extra LLM call). Tunable via env.
+        self.full_tool_result_window = int(os.environ.get("SAGE_FULL_TOOL_RESULT_WINDOW", "6"))
+        self.tool_result_truncate_chars = int(os.environ.get("SAGE_TOOL_RESULT_TRUNCATE_CHARS", "600"))
 
     def _generate_log_filename(self) -> str:
         """Generate a timestamped log filename"""
@@ -1070,9 +1097,19 @@ class MCPClientOAI:
             
             # Call Qwen3-VL with current messages and tools
             try:
+                # Identify which tool-result messages are "recent" (kept in full).
+                # Older tool results — the main source of context bloat (big JSON
+                # object lists) — are compressed to a short head so we can afford a
+                # high max_tool_calls without blowing up the context window.
+                tool_msg_indices = [
+                    i for i, m in enumerate(self.messages)
+                    if isinstance(m, dict) and m.get('role') == 'tool'
+                ]
+                recent_tool_indices = set(tool_msg_indices[-self.full_tool_result_window:])
+
                 # Prepare messages for API (use full-size images if available)
                 messages_for_api = []
-                for msg in self.messages:
+                for i, msg in enumerate(self.messages):
                     if isinstance(msg, dict) and 'content_for_api' in msg:
                         # Use full-size images for API call
                         api_msg = msg.copy()
@@ -1081,17 +1118,49 @@ class MCPClientOAI:
                         api_msg.pop('content_for_api', None)
                         api_msg.pop('images_metadata', None)
                         messages_for_api.append(api_msg)
+                    elif (isinstance(msg, dict) and msg.get('role') == 'tool'
+                          and i not in recent_tool_indices):
+                        # Compress an older tool result to a short head.
+                        api_msg = msg.copy()
+                        content = api_msg.get('content', '')
+                        if isinstance(content, str) and len(content) > self.tool_result_truncate_chars:
+                            api_msg['content'] = (
+                                content[:self.tool_result_truncate_chars]
+                                + f"\n...[older tool result truncated, {len(content)} chars total]"
+                            )
+                        messages_for_api.append(api_msg)
                     else:
                         messages_for_api.append(msg)
                 
                 # Prepare tools parameter - don't pass tools at all if empty
+                try:
+                    _max_tokens = int(os.environ.get("SAGE_MAX_TOKENS", "16384"))
+                except ValueError:
+                    _max_tokens = 16384
                 call_params = {
                     "model": self.MODEL_NAME,
                     "messages": messages_for_api,
-                    "max_tokens": 32768,
+                    "max_tokens": _max_tokens,
                     "temperature": 1.0,
                 }
-                
+                # Anti-repetition: the self-hosted Qwen3-VL-MoE can degenerate into a
+                # repetition loop while emitting long output (repeating the same
+                # sentence/placement line until it hits max_tokens, producing no
+                # usable tool call). A frequency penalty breaks this; it is
+                # OpenAI-standard and harmless on DashScope. Tunable via env.
+                try:
+                    _freq_pen = float(os.environ.get("SAGE_FREQUENCY_PENALTY", "0.3"))
+                except ValueError:
+                    _freq_pen = 0.3
+                if _freq_pen:
+                    call_params["frequency_penalty"] = _freq_pen
+                try:
+                    _rep_pen = float(os.environ.get("SAGE_REPETITION_PENALTY", "1.0"))
+                except ValueError:
+                    _rep_pen = 1.0
+                if _rep_pen and _rep_pen != 1.0:  # vLLM-specific; opt-in to stay API-portable
+                    call_params["extra_body"] = {"repetition_penalty": _rep_pen}
+
                 # Only add tools if we have any
                 if available_tools:
                     call_params["tools"] = available_tools
@@ -1238,12 +1307,44 @@ class MCPClientOAI:
                 print(f"   🔤 Response: {full_text}")
                 intermediate_responses_shown = True
 
-            # If no tool calls, we're done
+            # If no tool calls, we're done — UNLESS the model clearly derailed:
+            # either an unterminated/garbled <tool_call>, or a pure-text repetition
+            # loop (the self-hosted Qwen3-VL-MoE sometimes repeats the same sentence
+            # until max_tokens, e.g. a 163k-char "I'll now place..." loop). Silently
+            # returning there abandons the scene half-built. Feed a corrective
+            # message back and retry, bounded so a persistently-broken model still
+            # terminates.
             if not tool_calls:
+                content_str = message.content if hasattr(message, 'content') and message.content else ""
+                looks_derailed = (
+                    '<tool_call>' in content_str
+                    or len(content_str) > 20000  # far beyond any legitimate text answer
+                )
+                self._malformed_tool_call_retries = getattr(self, '_malformed_tool_call_retries', 0)
+                if looks_derailed and self._malformed_tool_call_retries < 3:
+                    self._malformed_tool_call_retries += 1
+                    print(f"⚠️  Detected a derailed response ({len(content_str)} chars, "
+                          f"no usable tool call — likely a repetition loop). Asking the "
+                          f"model to retry ({self._malformed_tool_call_retries}/3)...")
+                    self.messages.append({
+                        "role": "user",
+                        "content": (
+                            "Your previous response was truncated or stuck in a "
+                            "repetition loop and contained no usable tool call. "
+                            "Re-issue a SINGLE, well-formed tool call now. Keep it "
+                            "concise: place at most 5-8 objects per call, never repeat "
+                            "the same line, and ensure the JSON arguments are complete "
+                            "and valid."
+                        ),
+                        "timestamp": datetime.now().isoformat(),
+                    })
+                    continue
                 final_response = "\n".join(text_responses) if text_responses else "No response from Qwen3-VL."
                 print(f"✅ Conversation complete after {iteration} iteration(s)")
                 return final_response, intermediate_responses_shown
-            
+            # A successful tool call resets the derailment-retry budget.
+            self._malformed_tool_call_retries = 0
+
             # Check if we've reached the tool call limit
             if self.tool_call_count >= self.max_tool_calls:
                 warning_msg = f"⚠️  Reached maximum tool call limit ({self.max_tool_calls}). Stopping execution."

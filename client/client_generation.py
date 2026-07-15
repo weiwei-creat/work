@@ -426,9 +426,13 @@ class MCPClientOAI:
         self.total_tokens = 0
         self.api_call_count = 0
         
-        # Initialize tool call tracking
+        # Initialize tool call tracking (raised from old hard-coded 15 to allow
+        # richer scenes; configurable via SAGE_MAX_TOOL_CALLS).
         self.tool_call_count = 0
-        self.max_tool_calls = 15
+        self.max_tool_calls = int(os.environ.get("SAGE_MAX_TOOL_CALLS", "40"))
+        # Older tool results are compressed to a short head to bound context.
+        self.full_tool_result_window = int(os.environ.get("SAGE_FULL_TOOL_RESULT_WINDOW", "6"))
+        self.tool_result_truncate_chars = int(os.environ.get("SAGE_TOOL_RESULT_TRUNCATE_CHARS", "600"))
 
     def _generate_log_filename(self) -> str:
         """Generate a timestamped log filename"""
@@ -1019,9 +1023,17 @@ class MCPClientOAI:
             
             # Call Qwen3-VL with current messages and tools
             try:
+                # Compress older tool results (the main context-bloat source) so a
+                # high max_tool_calls stays within the context window.
+                tool_msg_indices = [
+                    i for i, m in enumerate(self.messages)
+                    if isinstance(m, dict) and m.get('role') == 'tool'
+                ]
+                recent_tool_indices = set(tool_msg_indices[-self.full_tool_result_window:])
+
                 # Prepare messages for API (use full-size images if available)
                 messages_for_api = []
-                for msg in self.messages:
+                for i, msg in enumerate(self.messages):
                     if isinstance(msg, dict) and 'content_for_api' in msg:
                         # Use full-size images for API call
                         api_msg = msg.copy()
@@ -1029,6 +1041,16 @@ class MCPClientOAI:
                         # Remove content_for_api and images_metadata from API message
                         api_msg.pop('content_for_api', None)
                         api_msg.pop('images_metadata', None)
+                        messages_for_api.append(api_msg)
+                    elif (isinstance(msg, dict) and msg.get('role') == 'tool'
+                          and i not in recent_tool_indices):
+                        api_msg = msg.copy()
+                        content = api_msg.get('content', '')
+                        if isinstance(content, str) and len(content) > self.tool_result_truncate_chars:
+                            api_msg['content'] = (
+                                content[:self.tool_result_truncate_chars]
+                                + f"\n...[older tool result truncated, {len(content)} chars total]"
+                            )
                         messages_for_api.append(api_msg)
                     else:
                         messages_for_api.append(msg)

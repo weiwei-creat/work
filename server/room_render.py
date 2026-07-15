@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
+
 from models import FloorPlan, Room, Wall
 from PIL import Image
 from PIL import ImageDraw, ImageFont
@@ -20,7 +22,15 @@ import numpy as np
 
 _NVDIFFRAST_RENDERER = None
 _NVDIFFRAST_IMPORT_ERROR = None
-_CPU_RENDER_FALLBACK_ENABLED = False
+# CPU fallback for room rendering. Enabled by default because nvdiffrast/torch
+# GPU rendering requires CUDA kernels for the host GPU's compute capability; on
+# newer GPUs (e.g. RTX 5080 / sm_120) the pinned torch 2.5.1+cu124 has no kernel
+# image and GPU rendering fails. The CPU path produces schematic top-down /
+# perspective images the semantic critic can still reason over. Set
+# SAGE_ENABLE_CPU_RENDER_FALLBACK=0 to force GPU-only (once torch supports the GPU).
+_CPU_RENDER_FALLBACK_ENABLED = os.environ.get(
+    "SAGE_ENABLE_CPU_RENDER_FALLBACK", "1"
+).lower() in ("1", "true", "yes")
 
 
 def _load_nvdiffrast_renderer():

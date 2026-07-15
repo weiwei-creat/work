@@ -93,9 +93,9 @@ You will use tools to generate a complete, realistic scene. The process involves
 
 === STEP 1: GENERATE ROOM LAYOUT ===
 
-Generate the room layout first. You must generate ONLY a single room.
+Generate the room layout first. Based on the description, generate EITHER a single room OR a multi-room layout (a house / apartment with multiple connected rooms) — whichever the description implies.
 
-[CRITICAL] When calling the layout generation tool, explicitly mention "a single room" without mentioning any other rooms or spaces.
+[IMPORTANT] If the description implies a whole home or several spaces (e.g. "apartment", "house", "two-bedroom", "a living room and a kitchen", "loft with ..."), generate ALL of those rooms in ONE layout call. If it describes a single space (e.g. "a kitchen", "a bedroom"), generate just one room. When calling the layout generation tool, state how many rooms and which room types to create. The layout generation returns scene requirements PER ROOM.
 
 The layout generation will return scene requirements containing:
 - Recommended objects to place
@@ -105,6 +105,8 @@ The layout generation will return scene requirements containing:
 === STEP 2: PLACE OBJECTS ===
 
 This is the core of your task. Follow the guidelines below carefully.
+
+[MULTI-ROOM] If the layout has more than one room, decorate EVERY room — do not leave any room empty. Work room by room: complete the placement stages below for one room (calling place_objects_in_room / move_one_object_with_condition_in_room with that room's room_id), then move on to the next room, until all rooms are furnished. Use each room's own scene requirements.
 
 --- 2.1 OBJECT PLACEMENT STRATEGY ---
 
@@ -170,9 +172,12 @@ SOURCE 3: Failed Placements (Retry Logic)
 --- 2.3 PLACEMENT CONSTRAINTS ---
 
 PER-CALL LIMITS:
-[CRITICAL] Maximum 35-40 objects per single placement call
-[CRITICAL] Maximum 10-12 object TYPES per single placement call
-[ENCOURAGED] Place multiple object types in a single call for efficiency
+[CRITICAL] Place at most 6-8 objects and at most 5-6 object TYPES per single placement call.
+[CRITICAL] Keep each tool call SHORT. Long placement calls cause the model to repeat
+  the same object line over and over and fail to terminate — which silently aborts the
+  whole generation. If a room needs more objects, make SEVERAL small calls instead of one big one.
+[CRITICAL] NEVER repeat the same object entry within a single call.
+[ENCOURAGED] Place a few related object types together per call, then call again for the rest.
 
 TOTAL SCENE LIMITS:
 - NO maximum on total objects across all calls
@@ -233,6 +238,12 @@ Your scene MUST achieve the following:
 --- 2.7 WHEN TO STOP (COMPLETION CHECKLIST) ---
 
 [CRITICAL] You MUST keep track of the current object placement status continuously.
+[CRITICAL] Do NOT call get_current_layout to do this. Each place_objects_in_room result
+  already tells you what was placed, and the layout-generation result already gave you every
+  room's room_id and scene requirements. Calling get_current_layout dumps the entire
+  (possibly multi-room) layout into the conversation, bloating context and making the model
+  more likely to derail into a repetition loop. Track status from the tool results you
+  already have instead.
 
 DO NOT STOP until ALL of the following conditions are met (OR stop_scene_generation is signaled):
 
@@ -441,9 +452,13 @@ class MCPClientOAI:
         self.total_tokens = 0
         self.api_call_count = 0
         
-        # Initialize tool call tracking
+        # Initialize tool call tracking (raised from old hard-coded 15 to allow
+        # richer scenes; configurable via SAGE_MAX_TOOL_CALLS).
         self.tool_call_count = 0
-        self.max_tool_calls = 15
+        self.max_tool_calls = int(os.environ.get("SAGE_MAX_TOOL_CALLS", "40"))
+        # Older tool results are compressed to a short head to bound context.
+        self.full_tool_result_window = int(os.environ.get("SAGE_FULL_TOOL_RESULT_WINDOW", "6"))
+        self.tool_result_truncate_chars = int(os.environ.get("SAGE_TOOL_RESULT_TRUNCATE_CHARS", "600"))
 
     def _generate_log_filename(self) -> str:
         """Generate a timestamped log filename"""
@@ -755,6 +770,16 @@ class MCPClientOAI:
                     abs_script_path = os.path.abspath(server_script_path)
                     conda_env_name = os.environ.get("CONDA_ENV_NAME", "sage")
                     
+                    # Forward ALL SAGE_* tuning vars to the layout server. Without this
+                    # the MCP server (started via conda run + bash -c) never sees knobs
+                    # like SAGE_CRITIC_FREQUENCY / SAGE_SEMANTIC_VLM_VIEWS / SAGE_PREVIEW_*,
+                    # so they are silently ignored.
+                    sage_exports = "".join(
+                        f"export {k}={shlex.quote(v)} && "
+                        for k, v in os.environ.items()
+                        if k.startswith("SAGE_") and v is not None
+                    )
+
                     # Create a bash command that sets up conda env and runs the script
                     server_command = (
                         f"cd {SERVER_DIR} && "
@@ -765,7 +790,7 @@ class MCPClientOAI:
                         f"export SLURM_JOB_ID={os.environ.get('SLURM_JOB_ID')} && "
                         f"export PHYSICS_CRITIC_ENABLED={os.environ.get('PHYSICS_CRITIC_ENABLED', 'true')} && "
                         f"export SEMANTIC_CRITIC_ENABLED={os.environ.get('SEMANTIC_CRITIC_ENABLED', 'true')} && "
-                        f"export SLURM_JOB_ID={os.environ.get('SLURM_JOB_ID')} && "
+                        f"{sage_exports}"
                         f"python {abs_script_path}"
                     )
                     bash_command = (
@@ -1034,27 +1059,75 @@ class MCPClientOAI:
             
             # Call Qwen3-VL with current messages and tools
             try:
-                # Prepare messages for API (use full-size images if available)
-                messages_for_api = []
-                for msg in self.messages:
-                    if isinstance(msg, dict) and 'content_for_api' in msg:
-                        # Use full-size images for API call
-                        api_msg = msg.copy()
-                        api_msg['content'] = msg['content_for_api']
-                        # Remove content_for_api and images_metadata from API message
-                        api_msg.pop('content_for_api', None)
-                        api_msg.pop('images_metadata', None)
-                        messages_for_api.append(api_msg)
-                    else:
-                        messages_for_api.append(msg)
-                
+                def build_messages_for_api():
+                    # Compress older tool results (the main context-bloat source) so a
+                    # high max_tool_calls stays within the context window. Rebuilt on
+                    # each retry so emergency compaction (below) takes effect.
+                    tool_msg_indices = [
+                        i for i, m in enumerate(self.messages)
+                        if isinstance(m, dict) and m.get('role') == 'tool'
+                    ]
+                    recent_tool_indices = set(tool_msg_indices[-self.full_tool_result_window:] if self.full_tool_result_window > 0 else [])
+
+                    # Prepare messages for API (use full-size images if available)
+                    built = []
+                    for i, msg in enumerate(self.messages):
+                        if isinstance(msg, dict) and 'content_for_api' in msg:
+                            # Use full-size images for API call
+                            api_msg = msg.copy()
+                            api_msg['content'] = msg['content_for_api']
+                            # Remove content_for_api and images_metadata from API message
+                            api_msg.pop('content_for_api', None)
+                            api_msg.pop('images_metadata', None)
+                            built.append(api_msg)
+                        elif (isinstance(msg, dict) and msg.get('role') == 'tool'
+                              and i not in recent_tool_indices):
+                            api_msg = msg.copy()
+                            content = api_msg.get('content', '')
+                            if isinstance(content, str) and len(content) > self.tool_result_truncate_chars:
+                                api_msg['content'] = (
+                                    content[:self.tool_result_truncate_chars]
+                                    + f"\n...[older tool result truncated, {len(content)} chars total]"
+                                )
+                            built.append(api_msg)
+                        else:
+                            built.append(msg)
+                    return built
+
+                messages_for_api = build_messages_for_api()
+
                 # Prepare tools parameter - don't pass tools at all if empty
+                # Output budget. Placement calls are short now (6-8 objects per
+                # call), so a 16k cap is generous while leaving far more of the
+                # model context window for the conversation itself.
+                try:
+                    _max_tokens = int(os.environ.get("SAGE_MAX_TOKENS", "16384"))
+                except ValueError:
+                    _max_tokens = 16384
                 call_params = {
                     "model": self.MODEL_NAME,
                     "messages": messages_for_api,
-                    "max_tokens": 32768,
+                    "max_tokens": _max_tokens,
                     "temperature": 1.0,
                 }
+                # Anti-repetition: the self-hosted Qwen3-VL-MoE can degenerate into a
+                # repetition loop while emitting a long tool-call (e.g. repeating the
+                # same "place 1 X ..." item until it hits max_tokens, leaving the
+                # <tool_call> unterminated and unparseable). A frequency penalty breaks
+                # this. DashScope didn't loop, and frequency_penalty is OpenAI-standard
+                # so it's safe either way. Tunable / disable via env.
+                try:
+                    _freq_pen = float(os.environ.get("SAGE_FREQUENCY_PENALTY", "0.3"))
+                except ValueError:
+                    _freq_pen = 0.3
+                if _freq_pen:
+                    call_params["frequency_penalty"] = _freq_pen
+                try:
+                    _rep_pen = float(os.environ.get("SAGE_REPETITION_PENALTY", "1.0"))
+                except ValueError:
+                    _rep_pen = 1.0
+                if _rep_pen and _rep_pen != 1.0:  # vLLM-specific; opt-in to stay API-portable
+                    call_params["extra_body"] = {"repetition_penalty": _rep_pen}
                 
                 # Only add tools if we have any
                 if available_tools:
@@ -1097,6 +1170,25 @@ class MCPClientOAI:
                     except Exception as e:
                         last_error = e
                         print(f"❌ API call failed: {str(e)}")
+                        # Context-window overflow: don't just retry the same payload —
+                        # aggressively compact the history (keep fewer full tool
+                        # results, truncate older ones harder) and rebuild before the
+                        # next attempt, so a long multi-room run degrades gracefully
+                        # instead of dying.
+                        err_text = str(e).lower()
+                        if any(tok in err_text for tok in (
+                            "context length", "maximum context", "context_length",
+                            "too many tokens", "longer than the model", "max_model_len",
+                        )):
+                            self.full_tool_result_window = max(1, self.full_tool_result_window // 2)
+                            self.tool_result_truncate_chars = max(200, self.tool_result_truncate_chars // 2)
+                            print(
+                                f"🗜️  Context overflow — compacting history "
+                                f"(full_tool_result_window={self.full_tool_result_window}, "
+                                f"tool_result_truncate_chars={self.tool_result_truncate_chars}) and retrying..."
+                            )
+                            messages_for_api = build_messages_for_api()
+                            call_params["messages"] = messages_for_api
                         if retry == max_retry - 1:
                             # Final retry failed
                             error_msg = f"Error calling Qwen3-VL API after {max_retry} attempts: {str(e)}"
@@ -1202,11 +1294,41 @@ class MCPClientOAI:
                 print(f"   🔤 Response: {full_text}")
                 intermediate_responses_shown = True
 
-            # If no tool calls, we're done
+            # If no tool calls, we're done — UNLESS the model clearly *intended* a
+            # tool call but it failed to parse (e.g. the self-hosted Qwen3-VL-MoE
+            # degenerated into a repetition loop and hit max_tokens with an
+            # unterminated/garbled <tool_call>). Silently returning there is the
+            # "multi-room: no output" bug: the agent ends with 0 objects placed.
+            # Instead, feed a corrective message back and let it retry — bounded by
+            # a small retry counter so a persistently-broken model still terminates.
             if not tool_calls:
+                content_str = message.content if hasattr(message, 'content') and message.content else ""
+                looks_like_truncated_tool_call = '<tool_call>' in content_str
+                self._malformed_tool_call_retries = getattr(self, '_malformed_tool_call_retries', 0)
+                if looks_like_truncated_tool_call and self._malformed_tool_call_retries < 3:
+                    self._malformed_tool_call_retries += 1
+                    print(f"⚠️  Detected an unparseable/truncated <tool_call> (likely a "
+                          f"repetition loop). Asking the model to retry "
+                          f"({self._malformed_tool_call_retries}/3)...")
+                    self.messages.append({
+                        "role": "user",
+                        "content": (
+                            "Your previous tool call could not be parsed — it was "
+                            "truncated or contained repeated/garbled content. Re-issue "
+                            "a SINGLE, well-formed tool call now. Keep it concise: "
+                            "place at most 5-8 objects in one place_objects_in_room "
+                            "call, never repeat the same object line, and make sure the "
+                            "JSON arguments are complete and valid. Do NOT call "
+                            "get_current_layout."
+                        ),
+                        "timestamp": datetime.now().isoformat(),
+                    })
+                    continue
                 final_response = "\n".join(text_responses) if text_responses else "No response from Qwen3-VL."
                 print(f"✅ Conversation complete after {iteration} iteration(s)")
                 return final_response, intermediate_responses_shown
+            # A successful tool call resets the malformed-retry budget.
+            self._malformed_tool_call_retries = 0
             
             # Check if we've reached the tool call limit
             if self.tool_call_count >= self.max_tool_calls:
@@ -1354,8 +1476,8 @@ async def main():
     parser.add_argument(
         '--max_tool_calls',
         type=int,
-        default=15,
-        help='Maximum number of MCP tool calls before stopping'
+        default=int(os.environ.get("SAGE_MAX_TOOL_CALLS", "40")),
+        help='Maximum number of MCP tool calls before stopping (default 40 or $SAGE_MAX_TOOL_CALLS)'
     )
     
     args = parser.parse_args()
@@ -1413,11 +1535,22 @@ async def main():
         print("\n🤔 Qwen3-VL is thinking...")
         
         response, responses_shown = await client.process_query(text_instruction, image_paths)
-        
+
         # Print the final response if no intermediate responses were shown
         if response and not responses_shown:
             print(f"\n🤖 Qwen3-VL: {response}")
-        
+
+        # Deterministic final step (do not rely on the agent calling it): export the
+        # integrated whole-scene result — combined USD collection + whole-layout
+        # preview renders — so multi-room layouts read as one building.
+        if "export_full_scene" in client.tool_server_map:
+            try:
+                print("\n🏠 Exporting integrated whole-scene (USD collection + full preview)...")
+                export_result = await client.call_tool_on_server("export_full_scene", {})
+                print(f"🏠 Whole-scene export result: {getattr(export_result, 'content', export_result)}")
+            except Exception as e:
+                print(f"⚠️  Whole-scene export failed (non-fatal): {e}")
+
         print(f"\n✅ Instruction completed. Exiting...")
 
         print(f"🔍 Layout ID: {client.layout_id}")

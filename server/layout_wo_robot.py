@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import sys
+import time
 sys.path.append("objects")
 import pdb
 import uuid
@@ -86,8 +87,10 @@ from isaacsim.isaac_mcp.server import (
     get_room_layout_scene_usd,
     create_single_room_layout_scene,
     create_single_room_layout_scene_from_room,
+    get_room_layout_scene_usd_separate,
     get_room_layout_scene_usd_separate_from_layout,
     render_room_preview,
+    render_layout_preview,
 )
 import copy
 from floor_plan_materials.room_material import MaterialSelector
@@ -116,6 +119,23 @@ current_layout: Optional[FloorPlan] = None
 room_num_calls: Dict = {}
 policy_analysis: Dict = {}
 occupancy_ratio: float = 45
+
+# Counts placement/move tool calls so the (expensive) physics+semantic critics
+# can run only every Nth call. SAGE_CRITIC_FREQUENCY=1 (default) runs them every
+# time; =3 runs them on every 3rd call (big speedup, fewer renders + VLM calls).
+_critic_call_counter = 0
+
+
+def should_run_critics() -> bool:
+    global _critic_call_counter
+    _critic_call_counter += 1
+    try:
+        freq = int(os.environ.get("SAGE_CRITIC_FREQUENCY", "1"))
+    except ValueError:
+        freq = 1
+    if freq <= 1:
+        return True
+    return (_critic_call_counter % freq) == 0
 
 # Track per-room object placement failures for auto-degradation
 # Format: {room_id: {object_type: failure_count}}
@@ -2080,6 +2100,25 @@ Analyze the conditions now:"""
         return {"operation_type": "add", "analysis": f"Error during analysis: {e}", "objects_to_remove": []}
 
 
+def is_user_requested_object(obj, layout) -> bool:
+    """True if the object's type appears in the user's original room description,
+    i.e. the user explicitly asked for it. Such objects must not be auto-removed by
+    a critic (e.g. a 'basketball'/'soccer ball' the user named). Set
+    SAGE_ALLOW_REMOVE_REQUESTED=true to disable this protection."""
+    try:
+        text = (getattr(layout, "created_from_text", "") or "").lower()
+    except Exception:
+        text = ""
+    if not text:
+        return False
+    def _norm(s):
+        return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+    ntext = _norm(text)
+    ntype = _norm(getattr(obj, "type", ""))
+    # e.g. type "soccerball" matches description "a soccer ball" (both -> "soccerball")
+    return bool(ntype) and len(ntype) >= 4 and ntype in ntext
+
+
 async def handle_object_removal(room: Room, current_layout: FloorPlan, operation_analysis: Dict[str, Any]) -> Dict[str, Any]:
     """
     Handle object removal from the room based on operation analysis
@@ -2108,9 +2147,14 @@ async def handle_object_removal(room: Room, current_layout: FloorPlan, operation
     removed_indices = set()
     remaining_indices = set()
     
+    protect_requested = not _env_flag("SAGE_ALLOW_REMOVE_REQUESTED", False)
+
     # First pass: identify objects to remove directly
     for i, obj in enumerate(room.objects):
         if obj.id in objects_to_remove_ids or obj.type in objects_to_remove_ids:
+            if protect_requested and is_user_requested_object(obj, current_layout):
+                print(f"🛡️ Keeping user-requested object '{obj.type}' (id={obj.id}); refusing removal.", file=sys.stderr)
+                continue
             removed_indices.add(i)
     
     # Second pass: recursively find children of removed objects
@@ -2825,11 +2869,21 @@ Focus on physical details for 3D generation."""
         #         "total_objects_after": len(final_room_objects)
         #     }
         
+        # Critics (physics + semantic) are the most expensive step (Isaac render
+        # + VLM call). SAGE_CRITIC_FREQUENCY lets them run only every Nth call.
+        run_critics = should_run_critics()
+        if not run_critics:
+            print("⏭️ Skipping critics this call (SAGE_CRITIC_FREQUENCY).", file=sys.stderr)
+            result["physics_critic_info"] = "Skipped (SAGE_CRITIC_FREQUENCY)"
+            result["semantic_critic_info"] = "Skipped (SAGE_CRITIC_FREQUENCY)"
+
         # Add physics critic result
-        if PHYSICS_CRITIC_ENABLED:
+        if run_critics and PHYSICS_CRITIC_ENABLED:
             try:
                 print("🔍 Running physics critic analysis...", file=sys.stderr)
+                _t = time.time()
                 physics_critic_result = await room_physics_critic(room_id)
+                print(f"[TIMING] physics_critic took {time.time()-_t:.1f}s", file=sys.stderr)
                 physics_critic_result = json.loads(physics_critic_result)
                 result["physics_critic_info"] = physics_critic_result
                 print("✅ Physics critic analysis complete", file=sys.stderr)
@@ -2838,15 +2892,16 @@ Focus on physical details for 3D generation."""
                 result["physics_critic_info"] = "Failed to do physics critic analysis"
 
         # Add semantic critic result
-        if SEMANTIC_CRITIC_ENABLED:
+        if run_critics and SEMANTIC_CRITIC_ENABLED:
             try:
                 print("🔍 Running semantic critic analysis...", file=sys.stderr)
-                # assert False, "TODO: add semantic critic"
+                _t = time.time()
                 semantic_critic_result = await room_semantic_critic(
-                    room_id, 
+                    room_id,
                     current_action_condition=placement_conditions.strip(),
                     propose_modifications=True
                 )
+                print(f"[TIMING] semantic_critic took {time.time()-_t:.1f}s", file=sys.stderr)
                 semantic_critic_result = json.loads(semantic_critic_result)
                 result["semantic_critic_info"] = semantic_critic_result
                 print("✅ Semantic critic analysis complete", file=sys.stderr)
@@ -2911,6 +2966,62 @@ Focus on physical details for 3D generation."""
             "error": f"Object placement recommendation failed: {str(e)}",
             "room_id": room_id
         })
+
+
+@mcp.tool()
+async def export_full_scene() -> str:
+    """
+    Export the integrated whole-scene result after ALL rooms are furnished:
+    1) a combined USD collection ({layout_id}_usd_collection/) containing every room's
+       walls (with door openings), doors and objects in shared global coordinates, and
+    2) whole-layout preview renders showing all rooms together in one image.
+
+    Call this ONCE as the very FINAL step, after object placement in every room is
+    complete. Do NOT call it between placements.
+    """
+    global current_layout
+
+    if current_layout is None:
+        return json.dumps({
+            "success": False,
+            "error": "No layout has been generated yet. Use 'generate_room_layout()' first."
+        })
+
+    _t0 = time.time()
+    output_path = str(Path(RESULTS_DIR) / f"{current_layout.id}")
+    os.makedirs(output_path, exist_ok=True)
+    export_layout_to_json(current_layout, os.path.join(output_path, f"{current_layout.id}.json"))
+
+    summary = {"success": True, "layout_id": current_layout.id}
+
+    usd_collection_dir = os.path.join(output_path, f"{current_layout.id}_usd_collection")
+    try:
+        col_result = get_room_layout_scene_usd_separate(output_path, usd_collection_dir)
+        col_status = col_result.get("status") if isinstance(col_result, dict) else "unknown"
+        summary["usd_collection"] = {"dir": usd_collection_dir, "status": col_status}
+        print(f"Full-scene USD collection exported: {usd_collection_dir} ({col_status})", file=sys.stderr)
+    except Exception as e:
+        summary["usd_collection"] = {"dir": usd_collection_dir, "status": f"error: {e}"}
+        print(f"Full-scene USD collection export failed (non-fatal): {e}", file=sys.stderr)
+
+    try:
+        resolution = int(os.environ.get("SAGE_PREVIEW_RESOLUTION", "512"))
+        num_views = int(os.environ.get("SAGE_FULL_PREVIEW_VIEWS", "4"))
+        prev_result = render_layout_preview(output_path, resolution=resolution, num_views=num_views)
+        if isinstance(prev_result, dict) and prev_result.get("status") == "success":
+            paths = prev_result.get("preview_paths", [])
+            summary["full_preview_paths"] = paths
+            print(f"Whole-layout preview rendered: {paths}", file=sys.stderr)
+        else:
+            summary["full_preview"] = f"error: {prev_result}"
+            print(f"Whole-layout preview render failed (non-fatal): {prev_result}", file=sys.stderr)
+    except Exception as e:
+        summary["full_preview"] = f"error: {e}"
+        print(f"Whole-layout preview render failed (non-fatal): {e}", file=sys.stderr)
+
+    print(f"[TIMING] export_full_scene took {time.time()-_t0:.1f}s", file=sys.stderr)
+    summary["message"] = "Whole-scene export finished. The scene generation task is complete."
+    return json.dumps(summary)
 
 
 @mcp.tool()
@@ -3331,28 +3442,38 @@ async def move_one_object_with_condition_in_room(ctx: Context, room_id: str = ""
 
         }
         
+        run_critics = should_run_critics()
+        if not run_critics:
+            print("⏭️ Skipping critics this call (SAGE_CRITIC_FREQUENCY).", file=sys.stderr)
+            result["physics_critic_info"] = "Skipped (SAGE_CRITIC_FREQUENCY)"
+            result["semantic_critic_info"] = "Skipped (SAGE_CRITIC_FREQUENCY)"
+
         # Add physics critic result
-        if PHYSICS_CRITIC_ENABLED:
+        if run_critics and PHYSICS_CRITIC_ENABLED:
             try:
                 print("🔍 Running physics critic analysis...", file=sys.stderr)
+                _t = time.time()
                 physics_critic_result = await room_physics_critic(room_id)
+                print(f"[TIMING] physics_critic took {time.time()-_t:.1f}s", file=sys.stderr)
                 physics_critic_result = json.loads(physics_critic_result)
                 result["physics_critic_info"] = physics_critic_result
                 print("✅ Physics critic analysis complete", file=sys.stderr)
             except Exception as e:
                 print(f"⚠️ Physics critic analysis failed: {str(e)}", file=sys.stderr)
                 result["physics_critic_info"] = "Failed to do physics critic analysis"
-        
+
 
         # Add semantic critic result
-        if SEMANTIC_CRITIC_ENABLED:
+        if run_critics and SEMANTIC_CRITIC_ENABLED:
             try:
                 print("🔍 Running semantic critic analysis...", file=sys.stderr)
+                _t = time.time()
                 semantic_critic_result = await room_semantic_critic(
-                    room_id, 
+                    room_id,
                     current_action_condition=condition.strip(),
                     propose_modifications=True
                 )
+                print(f"[TIMING] semantic_critic took {time.time()-_t:.1f}s", file=sys.stderr)
                 semantic_critic_result = json.loads(semantic_critic_result)
                 result["semantic_critic_info"] = semantic_critic_result
                 print("✅ Semantic critic analysis complete", file=sys.stderr)
@@ -3531,14 +3652,25 @@ async def room_semantic_critic(
         image_data_list = []
         saved_image_paths = [top_down_debug_path]
 
+        # Perspective views sent to the VLM, besides the always-on annotated top-down.
+        # 0 = top-down only (far fewer vision tokens → faster critic). The annotated
+        # top-down is what the critic uses to judge layout/placement/spacing; the
+        # perspective renders only add realism/material/lighting assessment.
+        try:
+            semantic_vlm_views = int(os.environ.get("SAGE_SEMANTIC_VLM_VIEWS", os.environ.get("SAGE_PREVIEW_VIEWS", "4")))
+        except ValueError:
+            semantic_vlm_views = 4
+
         perspective_image_source = "Isaac Sim/Replicator"
         try:
-            if not _env_flag("SAGE_USE_ISAAC_RENDER_FOR_VLM", True):
+            if semantic_vlm_views <= 0:
+                print("Semantic critic: sending annotated top-down view only (SAGE_SEMANTIC_VLM_VIEWS=0)", file=sys.stderr)
+            elif not _env_flag("SAGE_USE_ISAAC_RENDER_FOR_VLM", True):
                 raise RuntimeError("SAGE_USE_ISAAC_RENDER_FOR_VLM disabled")
-
-            isaac_render_paths = _prepare_isaac_rendered_views_for_vlm(room_id, vis_dir)
-            saved_image_paths.extend(isaac_render_paths)
-            image_data_list.extend(_read_png_as_base64(path) for path in isaac_render_paths)
+            else:
+                isaac_render_paths = _prepare_isaac_rendered_views_for_vlm(room_id, vis_dir, num_views=semantic_vlm_views)
+                saved_image_paths.extend(isaac_render_paths)
+                image_data_list.extend(_read_png_as_base64(path) for path in isaac_render_paths)
         except Exception as isaac_error:
             print(f"Isaac VLM renders unavailable: {isaac_error}", file=sys.stderr)
             if _env_flag("SAGE_REQUIRE_ISAAC_VLM_RENDERS", True):
@@ -3557,7 +3689,7 @@ async def room_semantic_critic(
                     "room_id": room_id
                 })
 
-            for i, rgb_array in enumerate(all_rgb):
+            for i, rgb_array in enumerate(all_rgb[:semantic_vlm_views]):
                 try:
                     rgb_uint8 = (rgb_array * 255).astype(np.uint8)
                     pil_image = PILImage.fromarray(rgb_uint8, 'RGB')
@@ -3605,14 +3737,23 @@ CURRENT ACTION CONTEXT:
 
 This describes the current object placement action being performed. Consider this context when evaluating the room layout.
 """
-        
+
+        if image_data_list:
+            images_provided_section = (
+                "1. First image: Annotated top-down orthogonal view with object bounding boxes (blue), facing directions (yellow arrows), and coordinate axes\n\n"
+                f"2. Next images: {len(image_data_list)} perspective rendered view(s) from different angles generated by {perspective_image_source}\n"
+                "   - Use these rendered images for visual realism, aesthetics, material appearance, lighting, object visibility, and overall room atmosphere assessment"
+            )
+        else:
+            images_provided_section = (
+                "1. Annotated top-down orthogonal view with object bounding boxes (blue), facing directions (yellow arrows), and coordinate axes\n"
+                "   - This single top-down view is authoritative for object positions, orientations, spacing, crowding, and whether the requirements are met. Judge layout from it."
+            )
+
         prompt = f"""You are an expert interior designer. Analyze this room design for semantic correctness and provide actionable improvement suggestions.
 
 IMAGES PROVIDED:
-1. First image: Annotated top-down orthogonal view with object bounding boxes (blue), facing directions (yellow arrows), and coordinate axes
-
-2. Next images: Four perspective rendered views from different angles generated by {perspective_image_source}
-   - Use these rendered images for visual realism, aesthetics, material appearance, lighting, object visibility, and overall room atmosphere assessment
+{images_provided_section}
 
 {user_demand_section}
 
@@ -3875,7 +4016,18 @@ At most 1-2 object adjustment analysis recommendations.
                     op_type = suggested_operation.get("type", "")
                     target_id = suggested_operation.get("target_object_id", "")
                     condition = suggested_operation.get("condition", "")
-                    
+
+                    # Never let the critic recommend deleting a user-requested object
+                    # (REMOVE/REPLACE). MOVE is still allowed. Override via SAGE_ALLOW_REMOVE_REQUESTED.
+                    if op_type.upper() in ("REMOVE", "REPLACE") and not _env_flag("SAGE_ALLOW_REMOVE_REQUESTED", False):
+                        target_obj = next(
+                            (o for o in room.objects if o.id in (obj_id, target_id) or o.type == obj_type),
+                            None,
+                        )
+                        if target_obj is not None and is_user_requested_object(target_obj, current_layout):
+                            print(f"🛡️ Semantic critic: dropping {op_type} for user-requested '{obj_type}' ({obj_id}).", file=sys.stderr)
+                            continue
+
                     # Build suggestion sentence from operation details
                     suggestion_parts = []
                     # if op_type:
@@ -4087,8 +4239,20 @@ async def room_physics_critic(room_id: str):
     num_objects = len(room_objects)
     # remove over-ceiling objects
     ceiling_height = target_room.ceiling_height
-    room_objects = [obj for obj in room_objects if obj.position.z + obj.dimensions.height <= ceiling_height]
+    filtered_objects = [obj for obj in room_objects if obj.position.z + obj.dimensions.height <= ceiling_height]
 
+    # Safety: a filter that drops (near-)everything almost always means a bad
+    # ceiling_height / unit mismatch, not that the whole room is above the
+    # ceiling. Don't let it silently empty a room.
+    if num_objects > 0 and len(filtered_objects) < max(1, int(num_objects * 0.4)):
+        print(
+            f"⚠️ over-ceiling filter would drop {num_objects - len(filtered_objects)}/{num_objects} "
+            f"objects (ceiling_height={ceiling_height}) — treating as suspicious, keeping all.",
+            file=sys.stderr,
+        )
+        filtered_objects = list(room_objects)
+
+    room_objects = filtered_objects
     print(f"removing over-ceiling objects: {num_objects} -> {len(room_objects)}", file=sys.stderr)
 
     for room in current_layout.rooms:

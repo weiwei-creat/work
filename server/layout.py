@@ -113,6 +113,22 @@ import hashlib
 current_layout: Optional[FloorPlan] = None
 room_num_calls: Dict = {}
 policy_analysis: Dict = {}
+# Per-room last semantic quality level (excellent=4 .. poor=1), used to detect
+# regressions and roll back a placement that made the room worse.
+room_quality_score: Dict = {}
+# Per-room last count of physics-unstable objects (a rollback signal that works
+# even when the semantic critic's rendering is unavailable).
+room_unstable_count: Dict = {}
+# Per-room last "highest issue priority" from the semantic critic (0-10, higher
+# = worse). Always computed from the critic's issues, so it is a more reliable
+# regression signal than the categorical rating (which the model may omit).
+room_issue_priority: Dict = {}
+# Roll back if a placement raises the worst-issue severity by at least this much.
+SEMANTIC_REGRESSION_DELTA = int(os.environ.get("SAGE_SEMANTIC_ROLLBACK_DELTA", "3"))
+# Map the semantic critic's categorical room rating to a comparable scalar.
+ROOM_RATING_VALUE = {"excellent": 4, "good": 3, "fair": 2, "poor": 1}
+# Roll back a placement that adds at least this many NEW physics-unstable objects.
+PHYSICS_REGRESSION_DELTA = int(os.environ.get("SAGE_PHYSICS_ROLLBACK_DELTA", "3"))
 occupancy_ratio: float = 20
 
 # Initialize FastMCP server
@@ -1463,7 +1479,9 @@ Extract and structure the following information:
 1. ROBOT TYPE: Identify the type of robot from the requirement text
    - "franka": Stationary Franka arm (no navigation capability)
    - "mobile_franka": Mobile Franka arm (has navigation capability)
-   - Look for keywords: "mobile" indicates mobile_franka, otherwise franka
+   - "unitree_g1": Unitree G1 bipedal humanoid robot. Navigation/locomotion only (walks to goals on the floor). No manipulation/arm task is performed.
+   - Look for keywords: "g1", "unitree", "humanoid", "biped", "legged" indicate unitree_g1; "mobile" (with a franka/arm) indicates mobile_franka; otherwise franka
+   - [IMPORTANT] For "unitree_g1", the task is pure navigation: the only valid atomic action is "navigate". Do NOT emit "pick" or "place" steps for unitree_g1.
 
 2. ROOM TYPE: Determine the most appropriate room type where this robot task would be performed
    - Consider the objects and activities mentioned
@@ -1483,7 +1501,7 @@ Extract and structure the following information:
      * Object size/height specifications (e.g., medium-height, tall)
      * Object placement proposals: Other multiple background objects and furniture (placed on floor or attached to wall) as well as decorated or functional objects on top of them according to the room type and size. 
      Come up with as many as possible object placement proposals. Give a list of at least 20 objects. 
-    Never propose addition of rugs, mats, curtains, blanket, ceiling-hanging objects (already installed), and never propose addition of robot (either franka or mobile franka) in the scene.
+    Never propose addition of rugs, mats, curtains, blanket, ceiling-hanging objects (already installed), and never propose addition of robot (franka, mobile franka, or unitree g1) in the scene.
      * Objects-per-surface rules (e.g., "2+ objects on each furniture surface")
      * Wall decorations and any constraints (e.g., "no rugs/mats/curtains/ceiling-hanging objects/ceiling objects")
    - List all minimum required objects with quantities and placement guidance
@@ -1499,6 +1517,7 @@ Extract and structure the following information:
    - List the sequence of atomic tasks
    - Be specific about what is picked/placed and where
    - You can't repeat the same action twice consecutively. for example, you can only pick or place one object at a time. when you need to pick another object, you need to place the first object first.
+   - [unitree_g1 ONLY] For a unitree_g1 humanoid, the task is pure navigation: emit ONLY "navigate" steps, each with a distinct floor target (a furniture/landmark to walk to). No "pick"/"place". The minimum required objects are the navigation landmarks/targets the robot walks between (place them on the floor, well separated, with clear navigable space in between).
 
 6. GENERALIZATION REQUIREMENTS: Determine what types of generalization are needed
    - POSE generalization: Same objects, different positions (common for pick/place)
@@ -1541,7 +1560,7 @@ OUTPUT FORMAT (JSON) You need to return json string with ```json at the beginnin
 ```json
 {{
     "success": true,
-    "robot_type": "franka|mobile_franka",
+    "robot_type": "franka|mobile_franka|unitree_g1",
     "room_type": "room_type_name",
     "minimum_required_objects": [
         {{
@@ -1706,9 +1725,12 @@ Analyze the given requirement now:"""
                 })
             
             # Validate robot_type field
-            if analysis_result.get("robot_type") not in ["franka", "mobile_franka"]:
+            if analysis_result.get("robot_type") not in ["franka", "mobile_franka", "unitree_g1"]:
                 # Try to infer from the original requirement text
-                if "mobile" in policy_requirement.lower():
+                req_lower = policy_requirement.lower()
+                if any(kw in req_lower for kw in ["g1", "unitree", "humanoid", "biped", "legged"]):
+                    analysis_result["robot_type"] = "unitree_g1"
+                elif "mobile" in req_lower:
                     analysis_result["robot_type"] = "mobile_franka"
                 else:
                     analysis_result["robot_type"] = "franka"
@@ -2567,7 +2589,10 @@ async def place_objects_in_room(ctx: Context, room_id: str = "", placement_condi
     """
     global current_layout
     global policy_analysis
-    
+    global room_quality_score
+    global room_unstable_count
+    global room_issue_priority
+
     print(f"🔧 Starting place_objects_in_room for room: {room_id}", file=sys.stderr)
     print(f"📝 Placement conditions: {placement_conditions}", file=sys.stderr)
     
@@ -2599,7 +2624,12 @@ async def place_objects_in_room(ctx: Context, room_id: str = "", placement_condi
     
     try:
         print(f"✅ Room found: {room.room_type} with {len(room.objects)} existing objects", file=sys.stderr)
-        
+
+        # Checkpoint the room's objects before mutating, so a placement that makes
+        # the scene worse (per the semantic critic) can be rolled back.
+        rollback_enabled = os.environ.get("SAGE_ENABLE_ROLLBACK", "true").lower() in ("1", "true", "yes")
+        objects_snapshot = copy.deepcopy(room.objects) if rollback_enabled else None
+
         # Check if API key is available
         api_key = ANTHROPIC_API_KEY
         if not api_key:
@@ -3017,6 +3047,43 @@ Focus on physical details for 3D generation."""
         
         result["all_objects"] = get_object_description_list(final_room_objects)
 
+        # Structured "under-populated supporting surfaces" so the designer can
+        # target them directly instead of subjectively guessing what is empty
+        # (drives object density, per SceneSmith's support-surface hierarchy).
+        try:
+            min_items_per_surface = int(os.environ.get("SAGE_MIN_ITEMS_PER_SURFACE", "2"))
+            surface_type_kw = ("table", "desk", "shelf", "counter", "cabinet", "nightstand",
+                               "dresser", "stand", "bench", "sideboard", "console", "credenza",
+                               "bookcase", "vanity", "bar")
+            child_counts = {}
+            for o in final_room_objects:
+                pid = getattr(o, "place_id", None)
+                if pid not in (None, "floor", "wall"):
+                    child_counts[pid] = child_counts.get(pid, 0) + 1
+            underpopulated = []
+            for o in final_room_objects:
+                if getattr(o, "place_id", None) != "floor":
+                    continue
+                if not any(kw in (o.type or "").lower() for kw in surface_type_kw):
+                    continue
+                n_children = child_counts.get(o.id, 0)
+                if n_children < min_items_per_surface:
+                    underpopulated.append({
+                        "supporter_id": o.id,
+                        "supporter_type": o.type,
+                        "items_on_it": n_children,
+                        "needed": min_items_per_surface,
+                    })
+            if underpopulated:
+                result["underpopulated_surfaces"] = underpopulated
+                result["underpopulated_surfaces_hint"] = (
+                    f"{len(underpopulated)} supporting surface(s) have fewer than "
+                    f"{min_items_per_surface} items. Place 2+ suitable small objects on each "
+                    f"(use the supporter_id as the placement location) to enrich the scene."
+                )
+        except Exception as _e:
+            print(f"⚠️ underpopulated-surface analysis failed: {_e}", file=sys.stderr)
+
         # Add operation-specific information
         if operation_analysis["operation_type"] == "remove" and removal_result:
             result["removal_info"] = {
@@ -3064,8 +3131,74 @@ Focus on physical details for 3D generation."""
                 print(f"⚠️ Semantic critic analysis failed: {str(e)}", file=sys.stderr)
                 result["semantic_critic_info"] = "Failed to do semantic critic analysis"
 
-        
-        
+        # Checkpoint/rollback: if this placement made the room WORSE (semantic
+        # rating dropped vs. the previous placement), revert to the snapshot and
+        # tell the designer to try a different approach. Mirrors SceneSmith's
+        # orchestrator rollback-on-score-regression.
+        if rollback_enabled and objects_snapshot is not None:
+            try:
+                sci = result.get("semantic_critic_info") or {}
+
+                # Signal A (semantic): the worst-issue severity jumped up vs. the
+                # last placement (highest_issue_priority is 0-10, higher = worse,
+                # and is always computed from the critic's issues). Falls back to
+                # the categorical rating only if priority is unavailable.
+                semantic_regression = False
+                new_priority = sci.get("highest_issue_priority")
+                prev_priority = room_issue_priority.get(room_id, None)
+                if isinstance(new_priority, int) and new_priority >= 0 and prev_priority is not None:
+                    semantic_regression = (new_priority - prev_priority >= SEMANTIC_REGRESSION_DELTA)
+
+                new_rating = sci.get("overall_room_rating", "")
+                new_val = ROOM_RATING_VALUE.get(str(new_rating).lower(), None)
+                prev_val = room_quality_score.get(room_id, None)
+                if not semantic_regression and new_val is not None and prev_val is not None:
+                    semantic_regression = (new_val < prev_val)
+
+                # Signal B (physics): this placement added several new unstable
+                # objects. Works even when rendering / semantic critic is down.
+                pci = result.get("physics_critic_info")
+                new_unstable = None
+                if isinstance(pci, dict) and isinstance(pci.get("unstable_objects"), list):
+                    new_unstable = len(pci["unstable_objects"])
+                prev_unstable = room_unstable_count.get(room_id, None)
+                physics_regression = (
+                    new_unstable is not None and prev_unstable is not None
+                    and new_unstable - prev_unstable >= PHYSICS_REGRESSION_DELTA
+                )
+
+                if semantic_regression or physics_regression:
+                    target_room = next((r for r in current_layout.rooms if r.id == room_id), None)
+                    if target_room is not None:
+                        target_room.objects = objects_snapshot
+                        export_layout_to_json(current_layout, output_path / f"{current_layout.id}.json")
+                    if semantic_regression:
+                        if isinstance(new_priority, int) and prev_priority is not None and new_priority - prev_priority >= SEMANTIC_REGRESSION_DELTA:
+                            reason = f"Placement raised the worst design-issue severity from {prev_priority} to {new_priority} (0-10)."
+                        else:
+                            reason = f"Placement lowered room rating from {prev_val} to {new_val} ({new_rating})."
+                    else:
+                        reason = f"Placement added {new_unstable - prev_unstable} new physics-unstable objects."
+                    print(f"↩️  Rollback ({'semantic' if semantic_regression else 'physics'}): "
+                          f"reverted placement in {room_id} — {reason}", file=sys.stderr)
+                    result["rollback"] = {
+                        "reverted": True,
+                        "reason": reason,
+                        "instruction": "This placement was reverted because it reduced room quality. "
+                                       "Try a DIFFERENT approach: place fewer/better-fitting objects, "
+                                       "fix orientations/positions, or target under-populated surfaces.",
+                    }
+                    result["all_objects"] = get_object_description_list(target_room.objects if target_room else [])
+                else:
+                    # Accept; remember the new quality signals for next time.
+                    if new_val is not None:
+                        room_quality_score[room_id] = new_val
+                    if new_unstable is not None:
+                        room_unstable_count[room_id] = new_unstable
+                    if isinstance(new_priority, int) and new_priority >= 0:
+                        room_issue_priority[room_id] = new_priority
+            except Exception as e:
+                print(f"⚠️ Rollback check failed (keeping placement): {str(e)}", file=sys.stderr)
 
         # Create room visualization
         try:
@@ -3994,6 +4127,10 @@ This describes the current object placement action being performed. Consider thi
 
         images_section = "IMAGES PROVIDED:\n" + "\n".join(image_description_parts) if image_description_parts else "IMAGES PROVIDED: No rendered images available. Use the room information below for text-based analysis only."
 
+        # Text description of the room for the prompt (was referenced below but
+        # never defined — only surfaced once rendering started succeeding).
+        room_description = get_room_description(room)
+
         prompt = f"""You are an expert interior designer. Analyze this room design for semantic correctness and provide actionable improvement suggestions.
 
 {images_section}
@@ -4338,8 +4475,11 @@ At most 1-2 object adjustment analysis recommendations.
         else:
             # Return only object additions
             result["next_step"]["actions"] = object_addition_actions
-        
-        
+
+        # Surface the categorical room rating + the worst issue score so callers
+        # (e.g. place_objects_in_room's rollback) can detect quality regressions.
+        result["overall_room_rating"] = claude_analysis.get("overall_room_rating", "")
+        result["highest_issue_priority"] = int(highest_priority_adjust)
 
         return json.dumps(result, indent=2)
         

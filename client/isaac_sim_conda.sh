@@ -20,9 +20,21 @@ CONDA_ENV_NAME="${CONDA_ENV_NAME:-sage}"
 ISAACSIM_PATH="${ISAAC_SIM_PATH:-/home/gaok/coding/isaacsim}"
 ISAACLAB_PATH="${ISAACLAB_PATH:-${SAGE_ROOT}/IsaacLab}"
 RELEASE_ROOT="${ISAACSIM_PATH}/_build/linux-x86_64/release"
+CONDA_ENV_PYTHON="${CONDA_PYTHON:-/home/gaok/anaconda3/envs/${CONDA_ENV_NAME}/bin/python}"
 
 echo "[INFO] Starting Isaac Sim with conda environment '${CONDA_ENV_NAME}'..."
-which python
+if [ -x "${CONDA_ENV_PYTHON}" ]; then
+    export PATH="$(dirname "${CONDA_ENV_PYTHON}"):${PATH:-}"
+    PYTHON_EXE="${CONDA_ENV_PYTHON}"
+elif command -v python >/dev/null 2>&1; then
+    PYTHON_EXE="$(command -v python)"
+elif command -v python3 >/dev/null 2>&1; then
+    PYTHON_EXE="$(command -v python3)"
+else
+    echo "[ERROR] Could not find a Python executable for Isaac Sim" >&2
+    exit 1
+fi
+echo "${PYTHON_EXE}"
 
 # Set up Isaac Sim environment variables
 export ISAACSIM_PATH="${ISAACSIM_PATH}"
@@ -109,7 +121,7 @@ elif [ -x "${RELEASE_ROOT}/isaac-sim.sh" ]; then
 fi
 
 # Override Python executable to use conda python
-export PYTHONEXE="$(which python)"
+export PYTHONEXE="${PYTHON_EXE}"
 
 echo "[INFO] Using Python from conda environment: ${PYTHONEXE}"
 echo "[INFO] Isaac Sim path: ${ISAACSIM_PATH}"

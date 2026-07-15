@@ -233,12 +233,19 @@ def get_object_candidates(object_info: dict, source: str = "generation"):
         retrieval_mode = os.environ.get("SAGE_OBJATHOR_RETRIEVAL_MODE", "embedding").lower()
         if retrieval_mode == "embedding":
             object_retriever = get_objathor_retriever()
+            # Relax the similarity threshold in steps, but never below the floor:
+            # a threshold of 0 returns the nearest asset no matter how unrelated,
+            # which is where most "weird-looking object" results came from. If no
+            # candidate clears the floor, the normal TRELLIS-generation fallback
+            # produces the object instead.
+            _min_sim = int(os.environ.get("SAGE_OBJATHOR_MIN_SIMILARITY", "24"))
             similarity_thresholds = [
-                int(os.environ.get("SAGE_OBJATHOR_SIMILARITY_THRESHOLD", "31")),
-                28,
-                24,
-                0,
-            ]
+                t for t in (
+                    int(os.environ.get("SAGE_OBJATHOR_SIMILARITY_THRESHOLD", "31")),
+                    28,
+                    24,
+                ) if t >= _min_sim
+            ] or [_min_sim]
             candidates_retrieved = []
             for similarity_threshold_floor in similarity_thresholds:
                 candidates_retrieved = object_retriever.retrieve(
@@ -253,6 +260,18 @@ def get_object_candidates(object_info: dict, source: str = "generation"):
                             file=sys.stderr,
                         )
                     break
+            if not candidates_retrieved and not trellis_generation_enabled():
+                # No generation fallback available: a nearest-neighbor match (may
+                # look off) still beats silently dropping a requested object.
+                candidates_retrieved = object_retriever.retrieve(
+                    [caption], 0,
+                    max_num_candidates=max(3, int(object_info.get("quantity", 1)))
+                )
+                if candidates_retrieved:
+                    print(
+                        f"Objathor retrieval LAST-RESORT (threshold 0, TRELLIS off) for: {caption}",
+                        file=sys.stderr,
+                    )
         else:
             object_retriever = ObjathorRetriever.__new__(ObjathorRetriever)
             candidates_retrieved = retrieve_objathor_by_text(

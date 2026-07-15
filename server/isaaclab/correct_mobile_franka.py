@@ -1224,8 +1224,20 @@ Be strict - only match objects that are semantically appropriate for the robot t
     # save the current layout to the original_json_path
     export_layout_to_json(current_layout, original_json_path)
 
-    if do_explicit_correction:
-    
+    if robot_type == "unitree_g1":
+        # Unitree G1 performs pure navigation. Path planning is lightweight (no GPU /
+        # Isaac needed) and its way-point output is required downstream for the
+        # kinematic walk, so we always run it regardless of do_explicit_correction.
+        from isaaclab.correct_g1_navigation import correct_g1_navigation_standalone
+        correction_result = await correct_g1_navigation_standalone(current_layout, room_id, temp_json_path)
+        correction_result_dict = json.loads(correction_result) if isinstance(correction_result, str) else correction_result
+        if correction_result_dict.get("success", False):
+            # Blockers may have been removed; persist the corrected layout.
+            shutil.copy2(temp_json_path, original_json_path)
+            print(f"Copied temp JSON to original JSON: {original_json_path}")
+
+    elif do_explicit_correction:
+
         if robot_type == "franka":
             pass
         elif robot_type == "mobile_franka":
@@ -1235,7 +1247,7 @@ Be strict - only match objects that are semantically appropriate for the robot t
                 "success": False,
                 "error": f"Invalid robot type: {robot_type}"
             })
-    
+
         # Parse correction result to check success
         correction_result_dict = json.loads(correction_result) if isinstance(correction_result, str) else correction_result
 

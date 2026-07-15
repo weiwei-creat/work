@@ -47,6 +47,66 @@ from isaacsim.isaac_mcp.server import (
     simulate_the_scene_groups
 )
 
+
+def remove_unstable_objects(objects, unstable_object_ids, label="room", requested_text=""):
+    """Drop physics-unstable objects, but never wipe (near-)everything in one pass.
+
+    A result that marks all / most objects unstable almost always means the
+    physics sim or the Isaac kit was unhealthy (crashed, timed out, returned a
+    spurious all-unstable result, or hit a unit mismatch) — not that the whole
+    room is genuinely broken. In that case we keep everything and log, so a flaky
+    backend can't silently empty a room that took many iterations to build.
+
+    Controlled by SAGE_MAX_UNSTABLE_REMOVAL_FRAC (default 0.6).
+
+    `requested_text` (the layout's created_from_text): objects whose type the user
+    explicitly asked for are NEVER removed for instability — a basketball is
+    "unstable" by nature (it rolls), and deleting it breaks instruction-following.
+    Disable via SAGE_ALLOW_REMOVE_REQUESTED=true.
+    """
+    objects = list(objects)
+    unstable = set(unstable_object_ids or [])
+    if not unstable:
+        return objects
+    allow_remove_requested = os.environ.get(
+        "SAGE_ALLOW_REMOVE_REQUESTED", ""
+    ).strip().lower() in {"1", "true", "yes"}
+    if requested_text and not allow_remove_requested:
+        ntext = re.sub(r"[^a-z0-9]", "", requested_text.lower())
+        protected = set()
+        for o in objects:
+            if o.id not in unstable:
+                continue
+            ntype = re.sub(r"[^a-z0-9]", "", (getattr(o, "type", "") or "").lower())
+            if ntype and len(ntype) >= 4 and ntype in ntext:
+                protected.add(o.id)
+        if protected:
+            print(
+                f"🛡️ keeping {len(protected)} user-requested 'unstable' {label} object(s) "
+                f"(e.g. balls roll but must stay): {sorted(protected)}",
+                file=sys.stderr,
+            )
+            unstable -= protected
+        if not unstable:
+            return objects
+    total = len(objects)
+    n_unstable = sum(1 for o in objects if o.id in unstable)
+    try:
+        max_frac = float(os.environ.get("SAGE_MAX_UNSTABLE_REMOVAL_FRAC", "0.6"))
+    except ValueError:
+        max_frac = 0.6
+    if total > 0 and n_unstable > max(1, int(total * max_frac)):
+        print(
+            f"⚠️ physics sim marked {n_unstable}/{total} {label} objects unstable "
+            f"(> {max_frac:.0%}) — treating as a spurious/failed result, keeping all.",
+            file=sys.stderr,
+        )
+        return objects
+    kept = [o for o in objects if o.id not in unstable]
+    print(f"removed {total - len(kept)} unstable {label} objects, {len(kept)} remain", file=sys.stderr)
+    return kept
+
+
 def find_valid_place_id(object_to_place: Object, object_candidates: List[Object]) -> str:
     """
     Find a valid place id for the object to place from the object candidates.
@@ -143,10 +203,54 @@ def place_objects(selected_objects: List[Object], room: Room, current_layout: Fl
     }
 
     room_id = room.id
-    
+
     if not selected_objects:
         return selected_objects, current_layout, claude_interactions
-    
+
+    # Sanity guard: large floor-standing furniture must never be stacked on top of
+    # another object (cabinets on beds, wardrobes on desks, ...). Also reject
+    # surface placements whose footprint dwarfs the supporter. Violations are
+    # silently retargeted to the floor instead of producing absurd stacks.
+    _FLOOR_ONLY_KEYWORDS = (
+        "cabinet", "wardrobe", "bookshelf", "bookcase", "shelving",
+        "bed", "sofa", "couch", "table", "desk", "refrigerator", "fridge",
+        "dresser", "nightstand", "armchair", "chair", "bench", "stove", "oven",
+        "washer", "dryer", "dishwasher", "tvstand", "tv_stand", "island",
+        "counter",
+    )
+    # Tabletop items whose names embed a furniture word ("table lamp", "desk
+    # organizer", ...) must NOT be forced to the floor by the keyword rule.
+    _SURFACE_OK_KEYWORDS = (
+        "lamp", "clock", "toy", "photo", "frame", "vase", "tray", "mug",
+        "plate", "bottle", "organizer", "miniature", "model", "decor",
+    )
+    _supporters = {o.id: o for o in list(selected_objects) + list(room.objects)}
+    for _obj in selected_objects:
+        if _obj.place_id in ("floor", "wall", "invalid"):
+            continue
+        _type = (_obj.type or "").lower()
+        _reason = None
+        if (any(k in _type for k in _FLOOR_ONLY_KEYWORDS)
+                and not any(k in _type for k in _SURFACE_OK_KEYWORDS)):
+            _reason = f"'{_obj.type}' is floor-standing furniture"
+        else:
+            _sup = _supporters.get(_obj.place_id)
+            if _sup is not None:
+                _obj_area = _obj.dimensions.width * _obj.dimensions.length
+                _sup_area = _sup.dimensions.width * _sup.dimensions.length
+                if _obj_area > 0.6 * _sup_area or _obj.dimensions.height > 1.2:
+                    _reason = (
+                        f"footprint/height too large for supporter '{_sup.type}' "
+                        f"({_obj_area:.2f}m² vs {_sup_area:.2f}m², h={_obj.dimensions.height:.2f}m)"
+                    )
+        if _reason:
+            print(
+                f"[PLACE-GUARD] {_obj.type} ({_obj.id}): refusing placement on "
+                f"'{_obj.place_id}' — {_reason}; placing on floor instead.",
+                file=sys.stderr,
+            )
+            _obj.place_id = "floor"
+
     # Sort objects by placement location
     floor_objects = [obj for obj in selected_objects if obj.place_id == "floor"]
     wall_objects = [obj for obj in selected_objects if obj.place_id == "wall"]
@@ -233,13 +337,13 @@ def place_objects(selected_objects: List[Object], room: Room, current_layout: Fl
             # raise exception
             pass
 
-        unstable_object_ids = result_sim["unstable_objects"]
-        print(f"number of unstable objects: ", len(unstable_object_ids), file=sys.stderr)
-        print(f"room.objects: ", len(room.objects), file=sys.stderr)
-        if len(unstable_object_ids) > 0:
-            print(f"unstable_object_ids: ", unstable_object_ids, file=sys.stderr)
-            room.objects = [obj for obj in room.objects if obj.id not in unstable_object_ids]
-            print(f"after removing unstable objects, room.objects: ", len(room.objects), file=sys.stderr)
+        if isinstance(result_sim, dict) and result_sim.get("status") == "success":
+            unstable_object_ids = result_sim.get("unstable_objects", [])
+            print(f"number of unstable objects: ", len(unstable_object_ids), file=sys.stderr)
+            print(f"room.objects: ", len(room.objects), file=sys.stderr)
+            room.objects = remove_unstable_objects(room.objects, unstable_object_ids, "floor/placement", getattr(current_layout, "created_from_text", ""))
+        else:
+            print("⚠️ physics sim did not succeed — keeping all objects (no unstable removal).", file=sys.stderr)
 
     
     
@@ -303,13 +407,13 @@ def place_objects(selected_objects: List[Object], room: Room, current_layout: Fl
             # raise exception
             pass
 
-        unstable_object_ids = result_sim["unstable_objects"]
-        print(f"number of unstable objects: ", len(unstable_object_ids), file=sys.stderr)
-        print(f"room.objects: ", len(room.objects), file=sys.stderr)
-        if len(unstable_object_ids) > 0:
-            print(f"unstable_object_ids: ", unstable_object_ids, file=sys.stderr)
-            room.objects = [obj for obj in room.objects if obj.id not in unstable_object_ids]
-            print(f"after removing unstable objects, room.objects: ", len(room.objects), file=sys.stderr)
+        if isinstance(result_sim, dict) and result_sim.get("status") == "success":
+            unstable_object_ids = result_sim.get("unstable_objects", [])
+            print(f"number of unstable objects: ", len(unstable_object_ids), file=sys.stderr)
+            print(f"room.objects: ", len(room.objects), file=sys.stderr)
+            room.objects = remove_unstable_objects(room.objects, unstable_object_ids, "floor/placement", getattr(current_layout, "created_from_text", ""))
+        else:
+            print("⚠️ physics sim did not succeed — keeping all objects (no unstable removal).", file=sys.stderr)
 
 
     if on_object_objects:
@@ -370,13 +474,13 @@ def place_objects(selected_objects: List[Object], room: Room, current_layout: Fl
             # raise exception
             pass
 
-        unstable_object_ids = result_sim["unstable_objects"]
-        print(f"number of unstable objects: ", len(unstable_object_ids), file=sys.stderr)
-        print(f"room.objects: ", len(room.objects), file=sys.stderr)
-        if len(unstable_object_ids) > 0:
-            print(f"unstable_object_ids: ", unstable_object_ids, file=sys.stderr)
-            room.objects = [obj for obj in room.objects if obj.id not in unstable_object_ids]
-            print(f"after removing unstable objects, room.objects: ", len(room.objects), file=sys.stderr)
+        if isinstance(result_sim, dict) and result_sim.get("status") == "success":
+            unstable_object_ids = result_sim.get("unstable_objects", [])
+            print(f"number of unstable objects: ", len(unstable_object_ids), file=sys.stderr)
+            print(f"room.objects: ", len(room.objects), file=sys.stderr)
+            room.objects = remove_unstable_objects(room.objects, unstable_object_ids, "floor/placement", getattr(current_layout, "created_from_text", ""))
+        else:
+            print("⚠️ physics sim did not succeed — keeping all objects (no unstable removal).", file=sys.stderr)
 
     # collect the object that failed to be placed
     failed_to_be_placed_objects = [obj for obj in objects_need_to_be_placed if obj.id not in [obj.id for obj in room.objects]]
@@ -905,8 +1009,20 @@ Please design the layout now:"""
         interaction_info["parsed_constraints"] = constraints
         
         if not constraints and new_objects:
-            interaction_info["error"] = "Failed to parse constraints from Claude response"
-            return existing_objects, interaction_info
+            # Never abort the whole placement because the VLM's constraint JSON
+            # didn't parse — that turns one bad response into an empty room.
+            # Place with sensible defaults instead (edge for large, middle bias
+            # comes from scoring anyway).
+            print(
+                "⚠️ no usable constraints parsed — falling back to default 'edge' "
+                "constraints for all new objects instead of aborting placement.",
+                file=sys.stderr,
+            )
+            interaction_info["constraints_fallback"] = "default-edge"
+            constraints = {
+                obj.id: [{"type": "global", "constraint": "edge"}]
+                for obj in new_objects
+            }
         
         # Prepare room geometry for DFS solver
         max_wall_thickness_cm = 0
@@ -1252,8 +1368,9 @@ def place_on_object_objects(on_object_objects: List[Object], room: Room, current
                         if isinstance(result_sim, dict) and result_sim.get("status") == "success":
                             unstable_object_ids = result_sim.get("unstable_objects", [])
                             if len(unstable_object_ids) > 0:
-                                room_copy_eval.objects = [o for o in room_copy_eval.objects if o.id not in unstable_object_ids]
-                                all_placed_objects[:] = [o for o in all_placed_objects if o.id not in unstable_object_ids]
+                                room_copy_eval.objects = remove_unstable_objects(room_copy_eval.objects, unstable_object_ids, "eval", getattr(current_layout, "created_from_text", ""))
+                                kept_ids = {o.id for o in room_copy_eval.objects}
+                                all_placed_objects[:] = [o for o in all_placed_objects if o.id in kept_ids]
                 except Exception as e:
                     print(f"Stability batch test failed (non-fatal): {e}", file=sys.stderr)
 
@@ -1401,6 +1518,10 @@ def parse_constraints(
                 if target in object2constraints:
                     # Target is a new object that's already been processed
                     target_is_valid = True
+                elif _resolve_new_object_id(target) is not None:
+                    # Short-id reference to another NEW object — resolve to full id
+                    actual_target = _resolve_new_object_id(target)
+                    target_is_valid = True
                 elif target in existing_object_ids:
                     # Target is an existing object - map it to its solver name
                     actual_target = existing_id_mapping.get(target, target)
@@ -1513,14 +1634,30 @@ def parse_constraints_from_json(
     
     object2constraints = {}
     
+    def _resolve_new_object_id(raw_id: str):
+        """The VLM sometimes echoes a SHORT id ('bed_1fbbb52d') instead of the full
+        solver id ('room_xxx_bed_1fbbb52d'). An exact-match-only check then drops
+        EVERY constraint entry, leaving the solver with no constraints at all (the
+        'empty room' failure). Resolve by unique suffix/substring match."""
+        if raw_id in new_object_ids:
+            return raw_id
+        matches = [oid for oid in new_object_ids if oid.endswith(raw_id) or raw_id in oid]
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
     for constraint_entry in constraints_list:
-        object_id = constraint_entry.get("object_id", "").strip()
+        raw_object_id = constraint_entry.get("object_id", "").strip()
         constraint_strings = constraint_entry.get("constraints", [])
-        
+
         # Only parse constraints for new objects (objects that need placement)
-        if object_id not in new_object_ids:
+        object_id = _resolve_new_object_id(raw_object_id)
+        if object_id is None:
+            print(f"Constraint entry for unknown object '{raw_object_id}' skipped", file=sys.stderr)
             continue
-            
+        if object_id != raw_object_id:
+            print(f"Constraint object id '{raw_object_id}' resolved to '{object_id}'", file=sys.stderr)
+
         object2constraints[object_id] = []
         
         for constraint_str in constraint_strings:
@@ -1567,6 +1704,10 @@ def parse_constraints_from_json(
                 
                 if target in object2constraints:
                     # Target is a new object that's already been processed
+                    target_is_valid = True
+                elif _resolve_new_object_id(target) is not None:
+                    # Short-id reference to another NEW object — resolve to full id
+                    actual_target = _resolve_new_object_id(target)
                     target_is_valid = True
                 elif target in existing_object_ids:
                     # Target is an existing object - map it to its solver name
@@ -3112,19 +3253,24 @@ class DFS_Solver_Floor:
             return max_solution, max_solution_constraints
         return None, None
 
+    def _best_solution_index(self, solutions):
+        # Prefer the solution that PLACES THE MOST OBJECTS (so explicitly-requested
+        # items aren't dropped just because they slightly lower the aesthetic score),
+        # breaking ties by total score.
+        best_index = 0
+        best_key = (-1, float("-inf"))
+        for i, solution in enumerate(solutions):
+            key = (len(solution), sum(obj[-1] for obj in solution.values()))
+            if key > best_key:
+                best_key = key
+                best_index = i
+        return best_index
+
     def get_max_solution(self, solutions):
-        path_weights = []
-        for solution in solutions:
-            path_weights.append(sum([obj[-1] for obj in solution.values()]))
-        max_index = np.argmax(path_weights)
-        return solutions[max_index]
+        return solutions[self._best_solution_index(solutions)]
 
     def get_max_solution_constraints(self, solutions):
-        path_weights = []
-        for solution in solutions:
-            path_weights.append(sum([obj[-1] for obj in solution.values()]))
-        max_index = np.argmax(path_weights)
-        return self.constraints_dict_list[max_index]
+        return self.constraints_dict_list[self._best_solution_index(solutions)]
 
     def dfs(self, room_poly, objects_list, constraints, grid_points, placed_objects, constraints_dict, branch_factor):
         if len(objects_list) == 0:
@@ -3146,15 +3292,46 @@ class DFS_Solver_Floor:
             room_poly, object_dim, object_constraints, grid_points, placed_objects
         )
 
+        # Relax-retry, two stages — instruction fidelity first:
+        # 1) Keep the ORIGINAL constraints but drop the score>=0 gate, so the best
+        #    available cell is still ranked by what the user/agent asked for
+        #    ("next to the bed", "near the desk", ...) even in a tight room.
+        # 2) Only if that still yields nothing, fall back to any collision-free
+        #    cell so an explicitly-requested object isn't silently dropped.
+        if len(placements) == 0:
+            placements, placements_constraints = self.get_possible_placements(
+                room_poly, object_dim, object_constraints,
+                grid_points, placed_objects, allow_negative=True,
+            )
+            if len(placements) > 0:
+                print(f"[RELAX-1] {object_id}: original constraints kept, low-score cell accepted", file=sys.stderr)
+        if len(placements) == 0:
+            placements, placements_constraints = self.get_possible_placements(
+                room_poly, object_dim,
+                [{"type": "global", "constraint": "middle"}],
+                grid_points, placed_objects, allow_negative=True,
+            )
+            if len(placements) > 0:
+                print(f"[RELAX-2] {object_id}: constraints dropped entirely (last resort)", file=sys.stderr)
+
         # Visualize the placements and scores for debugging
         # if placements:  # Only visualize if there are placements to show
         #     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # Include milliseconds
         #     vis_fig_name = f"dfs_{object_id}_{timestamp}"
         #     self.visualize_dfs_placements(room_poly, grid_points, placed_objects, placements, object_id, vis_fig_name, self.room_id)
 
-        if len(placements) == 0 and len(placed_objects) != 0:
-            self.solutions.append(placed_objects)
-            self.constraints_dict_list.append(constraints_dict)
+        if len(placements) == 0:
+            # Record the current partial as a candidate solution, then SKIP only this
+            # one object and keep placing the rest — so a single un-placeable item
+            # doesn't drop every object after it in the list.
+            if len(placed_objects) != 0:
+                self.solutions.append(placed_objects)
+                self.constraints_dict_list.append(constraints_dict)
+            print(f"[SKIP] {object_id}: no collision-free placement; continuing with remaining objects", file=sys.stderr)
+            return self.dfs(
+                room_poly, objects_list[1:], constraints, grid_points,
+                placed_objects, constraints_dict, branch_factor,
+            )
 
         paths = []
         
@@ -3208,7 +3385,7 @@ class DFS_Solver_Floor:
 
         return paths
 
-    def get_possible_placements(self, room_poly, object_dim, constraints, grid_points, placed_objects):
+    def get_possible_placements(self, room_poly, object_dim, constraints, grid_points, placed_objects, allow_negative=False):
         solutions = self.filter_collision(
             placed_objects, self.get_all_solutions(room_poly, grid_points, object_dim)
         )
@@ -3353,8 +3530,10 @@ class DFS_Solver_Floor:
             for placement in sorted_placements
         ]
 
-        # if the top score is less than 0, return an empty list
-        if sorted_solutions[0][-1] < 0:
+        # if the top score is less than 0, return an empty list — unless we're in a
+        # relaxed retry (allow_negative), where we accept any collision-free cell so
+        # an explicitly-requested object isn't dropped just for a low aesthetic score.
+        if not allow_negative and sorted_solutions[0][-1] < 0:
             return [], []
 
 
