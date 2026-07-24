@@ -21,3 +21,6 @@ matfuse-sd
 robomimic_data
 **/__pycache__
 **/*.pyc
+*.tar
+*.tar.gz
+*.tgz

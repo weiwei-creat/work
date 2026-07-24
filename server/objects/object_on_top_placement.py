@@ -839,8 +839,18 @@ def filter_placements_by_physics_critic(layout: FloorPlan, room: Room, object: O
     
     layout_id = layout.id
     scene_save_dir = f"{RESULTS_DIR}/{layout_id}"
+    os.makedirs(scene_save_dir, exist_ok=True)
 
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+    # The layout server may run inside the batch container while Isaac Sim runs
+    # on the host. Both processes must be able to read this file, so keep it in
+    # the shared layout directory instead of the container-private /tmp.
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        prefix=".placements-",
+        suffix=".json",
+        dir=scene_save_dir,
+        delete=False,
+    ) as f:
         placements_info_path = f.name
         json.dump(placements_info, f, indent=4)
 

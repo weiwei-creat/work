@@ -1349,7 +1349,17 @@ class MCPExtension(omni.ext.IExt):
                         if only_need_one:
                             break
                 
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            # Return the result through the same shared directory as the input.
+            # /tmp is process-local when the caller is a Docker job and Isaac
+            # runs on the host, so a /tmp result path is unreadable by the job.
+            shared_temp_dir = os.path.dirname(os.path.abspath(placements_info_path))
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                prefix=".safe-placements-",
+                suffix=".json",
+                dir=shared_temp_dir,
+                delete=False,
+            ) as f:
                 save_path = f.name
                 json.dump(safe_placements, f, indent=4)
 
