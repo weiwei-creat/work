@@ -49,7 +49,23 @@ def choose_artifacts(layout_dir: Path, layout_id: str) -> tuple[Path, Path]:
     return usd, thumb
 
 
-def upload_with_mc(files: list[tuple[Path, str]]) -> None:
+def collect_layout_artifacts(layout_dir: Path) -> list[Path]:
+    """Return stable, uploadable files while excluding transient hidden files."""
+    artifacts = []
+    for path in sorted(layout_dir.rglob("*")):
+        relative = path.relative_to(layout_dir)
+        if not path.is_file() or path.is_symlink():
+            continue
+        if any(part.startswith(".") or part == "__pycache__" for part in relative.parts):
+            continue
+        artifacts.append(path)
+    return artifacts
+
+
+def upload_with_mc(
+    files: list[tuple[Path, str]],
+    directories: list[tuple[Path, str]] | None = None,
+) -> None:
     mc = Path(os.environ.get("MINIO_MC_PATH", "/tools/mc"))
     if not mc.is_file():
         raise RuntimeError(f"MinIO client not found: {mc}")
@@ -66,6 +82,17 @@ def upload_with_mc(files: list[tuple[Path, str]]) -> None:
     for source, object_name in files:
         subprocess.run(
             [str(mc), "cp", str(source), f"{alias}/{bucket}/{object_name}"],
+            check=True,
+        )
+    for source, object_prefix in directories or []:
+        subprocess.run(
+            [
+                str(mc),
+                "mirror",
+                "--overwrite",
+                str(source),
+                f"{alias}/{bucket}/{object_prefix}",
+            ],
             check=True,
         )
 
@@ -172,6 +199,9 @@ def main() -> int:
 
     layout_dir = results_root / layout_id
     usd_source, thumb_source = choose_artifacts(layout_dir, layout_id)
+    layout_artifacts = collect_layout_artifacts(layout_dir)
+    if not layout_artifacts:
+        raise RuntimeError(f"no scene artifacts found under {layout_dir}")
     usd_output = output_dir / f"{scene_name}.usd"
     thumb_output = output_dir / "thumb.png"
     shutil.copy2(usd_source, usd_output)
@@ -185,6 +215,12 @@ def main() -> int:
                 "layout_id": layout_id,
                 "usd": usd_output.name,
                 "thumbnail": thumb_output.name,
+                "artifact_root": f"{layout_id}/",
+                "artifact_count": len(layout_artifacts),
+                "artifacts": [
+                    path.relative_to(layout_dir).as_posix()
+                    for path in layout_artifacts
+                ],
             },
             ensure_ascii=False,
             indent=2,
@@ -193,14 +229,20 @@ def main() -> int:
     )
 
     object_root = f"{prefix}/" if prefix else ""
+    layout_object_root = f"{object_root}{layout_id}"
     upload_with_mc(
         [
             (usd_output, f"{object_root}{scene_name}.usd"),
             (thumb_output, f"{object_root}thumb.png"),
             (manifest, f"{object_root}manifest.json"),
-        ]
+        ],
+        directories=[(layout_dir, layout_object_root)],
     )
-    print("[scene-gen] artifacts uploaded", flush=True)
+    print(
+        f"[scene-gen] artifacts uploaded: 3 canonical files and "
+        f"{len(layout_artifacts)} layout files under {layout_object_root}/",
+        flush=True,
+    )
     return 0
 
 

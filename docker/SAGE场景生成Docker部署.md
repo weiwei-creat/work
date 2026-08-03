@@ -5,10 +5,10 @@
 以下文件和资源当前位于单卡开发机 `172.16.41.23`：
 
 - Docker 镜像文件：`/data/gaok/sage/sage-scene-gen-isaac45.tar`
-- 镜像文件大小：1,823,773,696 字节（约 1.70 GiB）
+- 镜像文件大小：1,823,779,328 字节（约 1.70 GiB）
 - 镜像标签：`sage-scene-gen:isaac45-reproduced`
-- 23 号开发机当前镜像 ID：`sha256:9a2c82caafcdb745f4a026290276c00d024efd35b98d8093425ac9e7d10f6d48`
-- 镜像文件 SHA-256：`7ab60a2268069391ebd58f5db160aa8e84c9f130967447fe36f426679ea66da1`
+- 23 号开发机当前镜像 ID：`sha256:46286da6723126968ecf23823a8cf19be338980f90145c9f2b2b547d9d2dc489`
+- 镜像文件 SHA-256：`bce79d90983e0f8c5812d28514f03c84f20167fe369ad71eee7f5ff469033a51`
 - 项目目录：`/data/gaok/sage`
 - Objathor 资源目录：`/data/gaok/sage/objathor`，约 45 GB
 - 场景结果目录：`/data/gaok/sage/runtime/results`
@@ -28,7 +28,7 @@ sha256sum sage-scene-gen-isaac45.tar
 输出应为：
 
 ```text
-7ab60a2268069391ebd58f5db160aa8e84c9f130967447fe36f426679ea66da1  sage-scene-gen-isaac45.tar
+bce79d90983e0f8c5812d28514f03c84f20167fe369ad71eee7f5ff469033a51  sage-scene-gen-isaac45.tar
 ```
 
 > 镜像文件当前属于 `ubuntu` 用户。如果其他用户无法读取，请通过 `ubuntu` 用户执行部署，
@@ -44,7 +44,7 @@ sha256sum sage-scene-gen-isaac45.tar
   → 调用 LLM 编排场景
   → 连接容器外部的 Isaac Sim MCP
   → 生成 USD 和缩略图
-  → 上传 USD、缩略图及清单至 MinIO
+  → 上传标准入口文件和完整场景产物目录至 MinIO
   → 容器退出
 ```
 
@@ -248,7 +248,7 @@ cd /data/gaok/sage
 docker run --rm \
   --name sage-scene-modern-bedroom-001 \
   --network host \
-  --env-file /data/gaok/sage/runtime/scene-job.env \
+  --env-file /path/to/your/scene-job.env
   -e SAGE_OBJATHOR_ROOT=/data/gaok/sage/objathor \
   -e SAGE_RESULTS_DIR=/data/gaok/sage/runtime/results \
   -v /data/gaok/sage/objathor:/data/gaok/sage/objathor:ro \
@@ -298,13 +298,28 @@ docker rm sage-scene-job-001
 [scene-gen] artifacts uploaded
 ```
 
-MinIO 中会生成以下三个对象：
+MinIO 中会生成三个标准入口对象，并递归保存本次 `layout_id` 的完整结果目录：
 
 ```text
 <MINIO_OBJECT_PREFIX>/<SCENE_NAME>.usd
 <MINIO_OBJECT_PREFIX>/thumb.png
 <MINIO_OBJECT_PREFIX>/manifest.json
+<MINIO_OBJECT_PREFIX>/<layout_id>/
+├── <layout_id>.json
+├── <layout_id>.usd
+├── <layout_id>.usdz
+├── <layout_id>_view.usd
+├── <layout_id>_usd_collection/
+├── materials/
+├── objaverse/
+├── preview/
+├── room_<id>.json
+├── room_<id>.usd
+└── room_<id>.usdz
 ```
+
+完整目录会保留所有子目录及文件的相对路径，确保 USD/USDZ、材质、网格、纹理和预览之间的
+引用关系不因上传而改变。`.placements-*` 等隐藏临时文件及 `__pycache__` 不会上传。
 
 其中 `manifest.json` 的结构如下：
 
@@ -313,9 +328,20 @@ MinIO 中会生成以下三个对象：
   "scene_name": "modern-bedroom-001",
   "layout_id": "layout_xxxxxxxx",
   "usd": "modern-bedroom-001.usd",
-  "thumbnail": "thumb.png"
+  "thumbnail": "thumb.png",
+  "artifact_root": "layout_xxxxxxxx/",
+  "artifact_count": 83,
+  "artifacts": [
+    "layout_xxxxxxxx.json",
+    "layout_xxxxxxxx.usd",
+    "layout_xxxxxxxx.usdz",
+    "materials/room_xxxxxxxx_floor.png"
+  ]
 }
 ```
+
+`artifact_count` 取决于场景复杂度，示例中的 `83` 不是固定值；`artifacts` 会列出该任务实际
+上传的全部相对路径。
 
 宿主机共享结果目录中也会保留原始生成结果：
 
@@ -439,3 +465,8 @@ validation/final-20260724/manifest.json               143 B
 → 上传 MinIO → exit 0”部署链路可用。它不等同于对所有提示词的场景语义准确率作出保证；
 本次日志中桌面物体的表面放置未达到提示词预期，属于后续算法质量优化项，不影响镜像部署
 链路验收结论。
+
+2026-08-03 对完整结果目录上传进行了追加验证：源目录
+`layout_1394ed1a` 共 83 个文件、55,769,816 字节，MinIO 对应前缀中成功生成 83 个对象，
+顶层 USD/USDZ/JSON 及 `layout_1394ed1a_usd_collection/`、`materials/`、`objaverse/`、
+`preview/` 均已保留。

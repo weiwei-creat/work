@@ -1,8 +1,8 @@
 # 一次性场景生成镜像
 
 该镜像用于执行一次性批处理任务，而不是提供 Web 服务。容器启动后会从环境变量中读取配置，
-调用指定的大语言模型（LLM），驱动外部 Isaac Sim MCP 实例生成场景，将 USD 文件、缩略图和
-清单文件上传至 MinIO，然后自动退出。
+调用指定的大语言模型（LLM），驱动外部 Isaac Sim MCP 实例生成场景，将便于平台消费的 USD、
+缩略图和清单，以及保留原始目录结构的完整场景产物上传至 MinIO，然后自动退出。
 
 完整的镜像交付信息、Isaac Sim MCP 启动方法、任务运行命令和故障排查说明，请参阅
 [SAGE 场景生成 Docker 部署文档](./SAGE场景生成Docker部署.md)。
@@ -64,3 +64,19 @@ docker run --rm --network host \
 
 `scene-job.env` 应包含上文列出的任务、LLM 和 MinIO 变量，但不得提交到 Git 或随镜像分发。
 该容器不会暴露任何端口，也不会申请 GPU 设备。GPU 仅由容器外部运行的 Isaac Sim 使用。
+
+上传完成后，MinIO 的任务前缀下包含三个标准入口文件和一个完整结果目录：
+
+```text
+<SCENE_NAME>.usd
+thumb.png
+manifest.json
+<layout_id>/
+  ├── <layout_id>.json/.usd/.usdz
+  ├── <layout_id>_view.usd
+  ├── <layout_id>_usd_collection/
+  ├── materials/
+  ├── objaverse/
+  ├── preview/
+  └── room_*.json/.usd/.usdz
+```
