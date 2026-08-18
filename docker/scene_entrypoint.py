@@ -85,13 +85,28 @@ def upload_with_mc(
             check=True,
         )
     for source, object_prefix in directories or []:
+        object_prefix = object_prefix.strip("/")
+        if not object_prefix:
+            raise RuntimeError("refusing to mirror a directory to the MinIO bucket root")
+        target = f"{alias}/{bucket}/{object_prefix}"
+        # A retried task must not retain files from an earlier export of the
+        # same layout. Remove only this layout-specific prefix, then upload the
+        # filtered directory tree from scratch.
+        subprocess.run(
+            [str(mc), "rm", "--recursive", "--force", target],
+            check=True,
+        )
         subprocess.run(
             [
                 str(mc),
                 "mirror",
                 "--overwrite",
+                "--exclude",
+                ".*",
+                "--exclude",
+                "*/.*",
                 str(source),
-                f"{alias}/{bucket}/{object_prefix}",
+                target,
             ],
             check=True,
         )

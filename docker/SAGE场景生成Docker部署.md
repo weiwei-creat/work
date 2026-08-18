@@ -5,10 +5,10 @@
 以下文件和资源当前位于单卡开发机 `172.16.41.23`：
 
 - Docker 镜像文件：`/data/gaok/sage/sage-scene-gen-isaac45.tar`
-- 镜像文件大小：1,823,779,328 字节（约 1.70 GiB）
+- 镜像文件大小：1,823,804,416 字节（约 1.70 GiB）
 - 镜像标签：`sage-scene-gen:isaac45-reproduced`
-- 23 号开发机当前镜像 ID：`sha256:46286da6723126968ecf23823a8cf19be338980f90145c9f2b2b547d9d2dc489`
-- 镜像文件 SHA-256：`bce79d90983e0f8c5812d28514f03c84f20167fe369ad71eee7f5ff469033a51`
+- 23 号开发机当前镜像 ID：`sha256:b5a574928799c75734ddd42f944d6add359ab1f447e8f9ea695944a82fb87822`
+- 镜像文件 SHA-256：`898eaf01682115fb8661cd342355e30036bce574b40012ed886dfa55484b1404`
 - 项目目录：`/data/gaok/sage`
 - Objathor 资源目录：`/data/gaok/sage/objathor`，约 45 GB
 - 场景结果目录：`/data/gaok/sage/runtime/results`
@@ -28,7 +28,7 @@ sha256sum sage-scene-gen-isaac45.tar
 输出应为：
 
 ```text
-bce79d90983e0f8c5812d28514f03c84f20167fe369ad71eee7f5ff469033a51  sage-scene-gen-isaac45.tar
+898eaf01682115fb8661cd342355e30036bce574b40012ed886dfa55484b1404  sage-scene-gen-isaac45.tar
 ```
 
 > 镜像文件当前属于 `ubuntu` 用户。如果其他用户无法读取，请通过 `ubuntu` 用户执行部署，
@@ -128,6 +128,9 @@ ss -ltnp | grep ':11323'
 ```bash
 cd /data/gaok/sage
 mkdir -p runtime/results runtime/logs
+
+# 避免 Isaac 扩展较多时耗尽进程文件句柄
+ulimit -n 65536
 
 nohup env \
   CONDA_PYTHON=/home/ubuntu/miniconda3/envs/sage/bin/python \
@@ -321,6 +324,19 @@ MinIO 中会生成三个标准入口对象，并递归保存本次 `layout_id` �
 完整目录会保留所有子目录及文件的相对路径，确保 USD/USDZ、材质、网格、纹理和预览之间的
 引用关系不因上传而改变。`.placements-*` 等隐藏临时文件及 `__pycache__` 不会上传。
 
+主场景、房间场景和 USD collection 遵循以下交付约定：
+
+| 项目 | 固定值/行为 |
+|---|---|
+| 舞台朝向 | `upAxis=Z` |
+| 比例尺 | `metersPerUnit=1.0`，一单位等于一米 |
+| 根节点 | 不添加补偿旋转或缩放 |
+| 房顶 | 不导出 roof/ceiling Prim 或 collection 文件 |
+| 场景照明 | USD 自带 DomeLight 和 DistantLight，不依赖 Isaac 视口默认灯 |
+
+如果收到的 USD 是 `Y-up` 或 `metersPerUnit=0.01`，说明仍在使用旧版产物；米制 Isaac
+资产加入该旧舞台后可能显得约100倍过大，且场景可能侧倒。应重新导入最新镜像并重新生成。
+
 其中 `manifest.json` 的结构如下：
 
 ```json
@@ -470,3 +486,16 @@ validation/final-20260724/manifest.json               143 B
 `layout_1394ed1a` 共 83 个文件、55,769,816 字节，MinIO 对应前缀中成功生成 83 个对象，
 顶层 USD/USDZ/JSON 及 `layout_1394ed1a_usd_collection/`、`materials/`、`objaverse/`、
 `preview/` 均已保留。
+
+2026-08-18 使用 Isaac Sim 4.5 对 `layout_1394ed1a` 进行了 USD 交付修复和磁盘文件回读验证：
+
+- Isaac 通过 `open_stage` 直接打开 `/data/gaok/sage/runtime/results/layout_1394ed1a/layout_1394ed1a.usd`；
+- 检测结果为 `upAxis=Z`、`metersPerUnit=1.0`，根节点无补偿旋转；
+- 实际网格边界约为 `3.60 × 4.25 × 2.80 m`；
+- USD 内含两盏场景灯，ceiling/roof Prim 数为 `0`；
+- 主 USD、主 USDZ、房间 USD、房间 USDZ 均通过同一检查；
+- USD collection 共30个文件、14个 USD，ceiling文件数为 `0`；
+- Isaac 从已打开的磁盘 USD 渲染结果保存为
+  `preview/layout_1394ed1a_opened_in_isaac_fixed.png`。
+- 最终镜像内重试上传会先清理该 layout 的 MinIO 对象前缀；本次筛选后本地产物
+  85 个、48,482,229 字节，MinIO 对应前缀为 85 个对象，隐藏临时文件为 `0`。

@@ -54,6 +54,7 @@ import json
 import traceback
 import sys
 import gc
+import shutil
 from pxr import Gf, Usd, UsdGeom, UsdLux, Vt, UsdPhysics, PhysxSchema, UsdUtils, Sdf, UsdShade
 
 import omni
@@ -464,6 +465,7 @@ class MCPExtension(omni.ext.IExt):
             "get_room_layout_scene_usd": self.get_room_layout_scene_usd,
             "render_room_preview": self.render_room_preview,
             "render_layout_preview": self.render_layout_preview,
+            "validate_and_render_usd": self.validate_and_render_usd,
             "simulate_the_scene": self.simulate_the_scene,
             "test_object_placements_in_single_room": self.test_object_placements_in_single_room,
             "get_room_layout_scene_usd_separate": self.get_room_layout_scene_usd_separate,
@@ -1393,18 +1395,77 @@ class MCPExtension(omni.ext.IExt):
             stage = Usd.Stage.Open(existing_layer)
             if stage is None:
                 raise RuntimeError(f"Failed to reopen existing USD layer: {usd_file_path}")
+            self._set_metric_z_up(stage)
             return stage
 
         if os.path.exists(usd_file_path):
             os.remove(usd_file_path)
 
-        return Usd.Stage.CreateNew(usd_file_path)
+        stage = Usd.Stage.CreateNew(usd_file_path)
+        self._set_metric_z_up(stage)
+        return stage
+
+    @staticmethod
+    def _set_metric_z_up(stage):
+        """Author the coordinate convention used by Isaac and the generated geometry."""
+        # Scene meshes are generated in metres with Z as vertical. USD defaults
+        # to centimetres/Y-up when these metadata fields are omitted, which makes
+        # metre-authored Isaac assets appear roughly 100x too large and the room
+        # appear rotated when consumers honour the stage metadata.
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+
+    def _prepare_deliverable_stage(self, stage):
+        """Make a self-contained, correctly oriented, open-top, lit USD stage."""
+        self._set_metric_z_up(stage)
+
+        # The deliverable is an open-top simulation scene. Remove, rather than
+        # merely hide, ceiling geometry so a consumer cannot accidentally reveal
+        # it by changing viewport visibility or render purpose.
+        ceiling_paths = []
+        for prim in stage.Traverse():
+            path = prim.GetPath().pathString
+            if (
+                path.startswith("/World/floor_")
+                and (path.endswith("_ceiling") or path.endswith("_ceiling_mat"))
+            ):
+                ceiling_paths.append(path)
+        for path in sorted(ceiling_paths, key=len, reverse=True):
+            stage.RemovePrim(path)
+
+        # Store deterministic lights in the USD itself. They remain available
+        # when Isaac's viewport/default light is disabled.
+        for path in [
+            "/World/SAGEPreviewDomeLight",
+            "/World/SAGEPreviewDistantLight",
+            "/World/SAGEPreviewRectLight",
+            "/World/SAGEEnvironmentDomeLight",
+            "/World/SAGEEnvironmentDistantLight",
+        ]:
+            if stage.GetPrimAtPath(path):
+                stage.RemovePrim(path)
+
+        dome = UsdLux.DomeLight.Define(stage, "/World/SAGEEnvironmentDomeLight")
+        dome.CreateIntensityAttr(650.0)
+        dome.CreateExposureAttr(0.0)
+
+        distant = UsdLux.DistantLight.Define(stage, "/World/SAGEEnvironmentDistantLight")
+        distant.CreateIntensityAttr(800.0)
+        distant.CreateAngleAttr(0.5)
+        distant.AddRotateXYZOp().Set(Gf.Vec3f(-55.0, 0.0, 35.0))
 
     def _export_stage_snapshot(self, stage, scene_save_dir: str, base_name: str) -> str:
         os.makedirs(scene_save_dir, exist_ok=True)
         usd_file_path = os.path.abspath(os.path.join(scene_save_dir, f"{base_name}.usd"))
         if not stage.GetRootLayer().Export(usd_file_path):
             raise RuntimeError(f"Failed to export USD stage: {usd_file_path}")
+        # Normalize the exported copy so the active physics/placement stage is
+        # not mutated just because a deliverable snapshot was requested.
+        snapshot_stage = Usd.Stage.Open(usd_file_path)
+        if snapshot_stage is None:
+            raise RuntimeError(f"Failed to reopen exported USD stage: {usd_file_path}")
+        self._prepare_deliverable_stage(snapshot_stage)
+        snapshot_stage.GetRootLayer().Save()
         return usd_file_path
 
     def get_room_layout_scene_usd(self, scene_save_dir: str, usd_file_path: str):
@@ -1498,6 +1559,7 @@ class MCPExtension(omni.ext.IExt):
                     texture_door,
                     texture_door_frame
                 )
+            self._prepare_deliverable_stage(stage)
             stage.Save()
 
 
@@ -1557,6 +1619,9 @@ class MCPExtension(omni.ext.IExt):
                                         add_damping=True)
 
 
+        # Collection members are reusable assets, so keep them unlit while
+        # still declaring the correct metric/Z-up convention.
+        self._set_metric_z_up(stage)
         stage.Save()
 
 
@@ -1609,6 +1674,7 @@ class MCPExtension(omni.ext.IExt):
             texture_door_frame
         )
 
+        self._set_metric_z_up(stage)
         stage.Save()
 
 
@@ -1651,10 +1717,29 @@ class MCPExtension(omni.ext.IExt):
             rigid_object_property_dict = {}
             rigid_object_transform_dict = {}
 
+            # Rebuild the collection atomically from current scene contents so
+            # removed artifacts (notably the ceiling) cannot survive from an
+            # earlier export of the same layout.
+            if os.path.isdir(usd_collection_dir):
+                shutil.rmtree(usd_collection_dir)
             os.makedirs(usd_collection_dir, exist_ok=True)
 
-            room_base_ids = [mesh_id for mesh_id in mesh_info_dict.keys() if mesh_id.startswith("door_") or mesh_id.startswith("wall_room_") or mesh_id.startswith("window_") or mesh_id.startswith("floor_")]
-            rigid_object_ids = [mesh_id for mesh_id in mesh_info_dict.keys() if mesh_id not in room_base_ids]
+            room_base_ids = [
+                mesh_id
+                for mesh_id in mesh_info_dict.keys()
+                if (
+                    mesh_id.startswith("door_")
+                    or mesh_id.startswith("wall_room_")
+                    or mesh_id.startswith("window_")
+                    or mesh_id.startswith("floor_")
+                )
+                and not mesh_id.endswith("_ceiling")
+            ]
+            rigid_object_ids = [
+                mesh_id
+                for mesh_id in mesh_info_dict.keys()
+                if mesh_id not in room_base_ids and not mesh_id.endswith("_ceiling")
+            ]
 
             # save room base ids
 
@@ -1679,7 +1764,7 @@ class MCPExtension(omni.ext.IExt):
                 self.save_usd_with_ids(usd_file_path, mesh_info_dict, [rigid_object_id])
                 rigid_object_property_dict[rigid_object_id] = {
                     "static": mesh_info_dict[rigid_object_id]['static'],
-                    "mass": mesh_info_dict[rigid_object_id]['mass'],
+                    "mass": mesh_info_dict[rigid_object_id].get('mass', 1.0),
                     **mesh_info_dict[rigid_object_id].get("physics_metadata", {}),
                 }
                 rigid_object_transform_dict[rigid_object_id] = mesh_info_dict[rigid_object_id]["transform"]
@@ -1739,10 +1824,26 @@ class MCPExtension(omni.ext.IExt):
             rigid_object_property_dict = {}
             rigid_object_transform_dict = {}
 
+            if os.path.isdir(usd_collection_dir):
+                shutil.rmtree(usd_collection_dir)
             os.makedirs(usd_collection_dir, exist_ok=True)
 
-            room_base_ids = [mesh_id for mesh_id in mesh_info_dict.keys() if mesh_id.startswith("door_") or mesh_id.startswith("wall_room_") or mesh_id.startswith("window_") or mesh_id.startswith("floor_")]
-            rigid_object_ids = [mesh_id for mesh_id in mesh_info_dict.keys() if mesh_id not in room_base_ids]
+            room_base_ids = [
+                mesh_id
+                for mesh_id in mesh_info_dict.keys()
+                if (
+                    mesh_id.startswith("door_")
+                    or mesh_id.startswith("wall_room_")
+                    or mesh_id.startswith("window_")
+                    or mesh_id.startswith("floor_")
+                )
+                and not mesh_id.endswith("_ceiling")
+            ]
+            rigid_object_ids = [
+                mesh_id
+                for mesh_id in mesh_info_dict.keys()
+                if mesh_id not in room_base_ids and not mesh_id.endswith("_ceiling")
+            ]
 
             # save room base ids
 
@@ -1767,7 +1868,7 @@ class MCPExtension(omni.ext.IExt):
                 usd_file_path = f"{usd_collection_dir}/{rigid_object_id}.usd"
                 rigid_object_property_dict[rigid_object_id] = {
                     "static": mesh_info_dict[rigid_object_id]['static'],
-                    "mass": mesh_info_dict[rigid_object_id]['mass'],
+                    "mass": mesh_info_dict[rigid_object_id].get('mass', 1.0),
                     **mesh_info_dict[rigid_object_id].get("physics_metadata", {}),
                 }
                 rigid_object_transform_dict[rigid_object_id] = mesh_info_dict[rigid_object_id]["transform"]
@@ -2240,6 +2341,164 @@ Suggestions:
                 "status": "error",
                 "message": str(e)
             }
+
+    async def validate_and_render_usd(
+        self,
+        usd_file_path: str,
+        output_path: str,
+        resolution: int = 640,
+    ):
+        """Open a delivered USD in Isaac, validate its contract, and render it."""
+        try:
+            usd_file_path = os.path.abspath(usd_file_path)
+            output_path = os.path.abspath(output_path)
+            if not os.path.isfile(usd_file_path):
+                return {"status": "error", "message": f"USD not found: {usd_file_path}"}
+
+            context = omni.usd.get_context()
+            if not context.open_stage(usd_file_path):
+                return {"status": "error", "message": f"Isaac could not open USD: {usd_file_path}"}
+
+            app = omni.kit.app.get_app()
+            for _ in range(12):
+                await app.next_update_async()
+            stage = context.get_stage()
+            if stage is None:
+                return {"status": "error", "message": "Isaac opened no active stage"}
+
+            up_axis = str(UsdGeom.GetStageUpAxis(stage))
+            meters_per_unit = float(UsdGeom.GetStageMetersPerUnit(stage))
+            ceiling_paths = []
+            light_paths = []
+            mesh_min = np.array([np.inf, np.inf, np.inf], dtype=float)
+            mesh_max = np.array([-np.inf, -np.inf, -np.inf], dtype=float)
+            xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
+
+            for prim in stage.Traverse():
+                path = prim.GetPath().pathString
+                if "ceiling" in prim.GetName().lower() or "roof" in prim.GetName().lower():
+                    ceiling_paths.append(path)
+                if prim.IsA(UsdLux.BoundableLightBase) or "light" in prim.GetTypeName().lower():
+                    light_paths.append(path)
+                if not prim.IsA(UsdGeom.Mesh):
+                    continue
+                points = UsdGeom.Mesh(prim).GetPointsAttr().Get() or []
+                matrix = xform_cache.GetLocalToWorldTransform(prim)
+                for point in points:
+                    world = matrix.Transform(
+                        Gf.Vec3d(float(point[0]), float(point[1]), float(point[2]))
+                    )
+                    mesh_min = np.minimum(mesh_min, np.asarray(world, dtype=float))
+                    mesh_max = np.maximum(mesh_max, np.asarray(world, dtype=float))
+
+            if up_axis.upper() != "Z":
+                return {"status": "error", "message": f"USD upAxis is {up_axis}, expected Z"}
+            if abs(meters_per_unit - 1.0) > 1e-9:
+                return {
+                    "status": "error",
+                    "message": f"USD metersPerUnit is {meters_per_unit}, expected 1.0",
+                }
+            if ceiling_paths:
+                return {"status": "error", "message": f"USD still contains ceilings: {ceiling_paths}"}
+            if not light_paths:
+                return {"status": "error", "message": "USD contains no authored light"}
+            if not np.all(np.isfinite(mesh_min)) or not np.all(np.isfinite(mesh_max)):
+                return {"status": "error", "message": "USD contains no renderable mesh bounds"}
+
+            mesh_size = mesh_max - mesh_min
+            center = (mesh_min + mesh_max) / 2.0
+            span = max(float(mesh_size[0]), float(mesh_size[1]), 1.0)
+            camera_pos = np.array(
+                [
+                    mesh_min[0] - span * 0.35,
+                    mesh_min[1] - span * 0.35,
+                    mesh_max[2] + span * 0.8,
+                ],
+                dtype=float,
+            )
+            lookat = np.array(
+                [center[0], center[1], mesh_min[2] + mesh_size[2] * 0.35],
+                dtype=float,
+            )
+
+            import glob
+            import omni.replicator.core as rep
+
+            render_dir = os.path.join(
+                os.path.dirname(output_path),
+                f"._isaac_opened_{os.path.splitext(os.path.basename(output_path))[0]}",
+            )
+            if os.path.isdir(render_dir):
+                shutil.rmtree(render_dir)
+            os.makedirs(render_dir, exist_ok=True)
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+            camera = rep.create.camera(
+                position=tuple(float(v) for v in camera_pos),
+                look_at=tuple(float(v) for v in lookat),
+                clipping_range=(0.01, 1000000.0),
+                focal_length=24.0,
+                name="SAGEDeliverableValidationCamera",
+            )
+            render_product = rep.create.render_product(
+                camera,
+                (int(resolution), int(resolution)),
+                force_new=True,
+            )
+            writer = rep.WriterRegistry.get("BasicWriter")
+            writer.initialize(
+                output_dir=render_dir,
+                rgb=True,
+                image_output_format="png",
+                frame_padding=4,
+            )
+            writer.attach([render_product])
+            try:
+                await rep.orchestrator.step_async(
+                    rt_subframes=int(os.environ.get("SAGE_RT_SUBFRAMES", "4")),
+                    pause_timeline=True,
+                    wait_for_render=True,
+                )
+            except TypeError as exc:
+                if "wait_for_render" not in str(exc):
+                    raise
+                await rep.orchestrator.step_async(
+                    rt_subframes=int(os.environ.get("SAGE_RT_SUBFRAMES", "4")),
+                    pause_timeline=True,
+                )
+            await rep.orchestrator.wait_until_complete_async()
+            writer.detach()
+
+            candidates = sorted(
+                glob.glob(os.path.join(render_dir, "**", "rgb_*.png"), recursive=True)
+            )
+            if not candidates:
+                return {"status": "error", "message": "Isaac produced no validation PNG"}
+            shutil.copy2(candidates[-1], output_path)
+            validation_error = self._validate_preview_png(output_path)
+            if validation_error:
+                return {
+                    "status": "error",
+                    "message": f"Loaded-USD render is invalid: {validation_error}",
+                }
+
+            return {
+                "status": "success",
+                "message": "USD opened and rendered in Isaac Sim",
+                "usd_file_path": usd_file_path,
+                "preview_path": output_path,
+                "up_axis": up_axis,
+                "meters_per_unit": meters_per_unit,
+                "mesh_bounds_min": [float(v) for v in mesh_min],
+                "mesh_bounds_max": [float(v) for v in mesh_max],
+                "mesh_size_m": [float(v) for v in mesh_size],
+                "light_paths": light_paths,
+                "ceiling_paths": ceiling_paths,
+            }
+        except Exception as exc:
+            print(f"Error validating delivered USD: {exc}")
+            traceback.print_exc()
+            return {"status": "error", "message": str(exc)}
 
     def _prepare_layout_preview_stage(self, stage, layout_center: np.ndarray, max_height: float):
         """Hide every room's ceiling (dollhouse view) and add deterministic preview lights."""

@@ -65,6 +65,20 @@ docker run --rm --network host \
 `scene-job.env` 应包含上文列出的任务、LLM 和 MinIO 变量，但不得提交到 Git 或随镜像分发。
 该容器不会暴露任何端口，也不会申请 GPU 设备。GPU 仅由容器外部运行的 Isaac Sim 使用。
 
+## USD 交付约定
+
+交付的主 USD、房间 USD 和对应 USDZ 统一采用 Isaac Sim 原生约定：
+
+- `upAxis=Z`，不在根节点附加补偿旋转；
+- `metersPerUnit=1.0`，几何尺寸以米为单位；
+- 不包含 roof/ceiling Prim，打开后直接显示室内；
+- USD 内置 `SAGEEnvironmentDomeLight` 和 `SAGEEnvironmentDistantLight`，关闭
+  Isaac 视口默认灯后场景仍有照明；
+- USD collection 保持同样的 Z-up/米制元数据，并且不导出 ceiling 文件。
+
+不要把旧版本中声明为 `Y-up`、`metersPerUnit=0.01` 的原始 USD 作为交付物。该旧元数据会让
+Isaac 米制资产表现出旋转异常和约 100 倍的比例差异。
+
 上传完成后，MinIO 的任务前缀下包含三个标准入口文件和一个完整结果目录：
 
 ```text
