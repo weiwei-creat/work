@@ -30,8 +30,8 @@ def isaac_endpoint(value: str) -> tuple[str, int]:
 
 def choose_artifacts(layout_dir: Path, layout_id: str) -> tuple[Path, Path]:
     usd_candidates = [
-        layout_dir / f"{layout_id}_view.usd",
         layout_dir / f"{layout_id}.usd",
+        layout_dir / f"{layout_id}_view.usd",
     ]
     usd_candidates.extend(sorted(layout_dir.glob("*.usd")))
     usd = next((path for path in usd_candidates if path.is_file()), None)

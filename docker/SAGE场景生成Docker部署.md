@@ -5,10 +5,10 @@
 以下文件和资源当前位于单卡开发机 `172.16.41.23`：
 
 - Docker 镜像文件：`/data/gaok/sage/sage-scene-gen-isaac45.tar`
-- 镜像文件大小：1,823,804,416 字节（约 1.70 GiB）
+- 镜像文件大小：1,823,836,672 字节（约 1.70 GiB）
 - 镜像标签：`sage-scene-gen:isaac45-reproduced`
-- 23 号开发机当前镜像 ID：`sha256:b5a574928799c75734ddd42f944d6add359ab1f447e8f9ea695944a82fb87822`
-- 镜像文件 SHA-256：`898eaf01682115fb8661cd342355e30036bce574b40012ed886dfa55484b1404`
+- 23 号开发机当前镜像 ID：`sha256:ab3a6c0db112cd38f7624811df8ef92d3202bea1434969e020c289d5175da297`
+- 镜像文件 SHA-256：`f6c51f52daf620300d6f26dca8f906427532f91c7588ea91e198868ed8c4c3c0`
 - 项目目录：`/data/gaok/sage`
 - Objathor 资源目录：`/data/gaok/sage/objathor`，约 45 GB
 - 场景结果目录：`/data/gaok/sage/runtime/results`
@@ -28,7 +28,7 @@ sha256sum sage-scene-gen-isaac45.tar
 输出应为：
 
 ```text
-898eaf01682115fb8661cd342355e30036bce574b40012ed886dfa55484b1404  sage-scene-gen-isaac45.tar
+f6c51f52daf620300d6f26dca8f906427532f91c7588ea91e198868ed8c4c3c0  sage-scene-gen-isaac45.tar
 ```
 
 > 镜像文件当前属于 `ubuntu` 用户。如果其他用户无法读取，请通过 `ubuntu` 用户执行部署，
@@ -333,6 +333,10 @@ MinIO 中会生成三个标准入口对象，并递归保存本次 `layout_id` �
 | 根节点 | 不添加补偿旋转或缩放 |
 | 房顶 | 不导出 roof/ceiling Prim 或 collection 文件 |
 | 场景照明 | USD 自带 DomeLight 和 DistantLight，不依赖 Isaac 视口默认灯 |
+| 固定环境 | 地板、墙、窗、门和灯放在 `/World/Room` |
+| 可编辑物件 | 家具放在 `/World/Objects`，每件物体是独立 Xform |
+| 物件内部 | 每个物件包含 `Geometry` Mesh 和 `Material` Material |
+| 门结构 | `/World/Room/Doors/Door_<id>` 包含 `Frame`、`Panel`、`Hinge` |
 
 如果收到的 USD 是 `Y-up` 或 `metersPerUnit=0.01`，说明仍在使用旧版产物；米制 Isaac
 资产加入该旧舞台后可能显得约100倍过大，且场景可能侧倒。应重新导入最新镜像并重新生成。
@@ -499,3 +503,13 @@ validation/final-20260724/manifest.json               143 B
   `preview/layout_1394ed1a_opened_in_isaac_fixed.png`。
 - 最终镜像内重试上传会先清理该 layout 的 MinIO 对象前缀；本次筛选后本地产物
   85 个、48,482,229 字节，MinIO 对应前缀为 85 个对象，隐藏临时文件为 `0`。
+
+2026-08-21 对主 USD 的可编辑层级进行了追加验证：
+
+- `/World/Room` 包含 `Floor`、`Walls`、`Windows`、`Doors`、`Lights`；
+- 门位于 `/World/Room/Doors/Door_4d1430cc`，包含 `Frame`、`Panel`和
+  `PhysicsRevoluteJoint` 类型的 `Hinge`；
+- `/World/Objects` 下共 8 个独立物件 Xform，每个都有 `translate`、`rotateXYZ`、
+  `Geometry` 和 `Material`；
+- Isaac Sim 4.5 从磁盘重新打开层级化 USD 并成功渲染
+  `preview/layout_1394ed1a_hierarchy_fixed.png`，材质、比例、灯光和朝向正常。

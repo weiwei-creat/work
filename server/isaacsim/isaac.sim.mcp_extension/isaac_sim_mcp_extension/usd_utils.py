@@ -23,7 +23,7 @@ def AddTranslate(top, offset):
 def convert_mesh_to_usd(stage, usd_internal_path, verts, faces, collision_approximation, static, articulation, 
                         physics_iter=(16, 1), mass=None, apply_debug_torque=False, debug_torque_value=50.0, 
                         texture=None, usd_internal_art_reference_path="/World",
-                        add_damping=False):
+                        add_damping=False, usd_material_path=None):
     n_verts = verts.shape[0]
     n_faces = faces.shape[0]
 
@@ -62,7 +62,7 @@ def convert_mesh_to_usd(stage, usd_internal_path, verts, faces, collision_approx
                                     UsdGeom.Tokens.faceVarying)
         texCoords.Set(Vt.Vec2fArray.FromNumpy(tex_coords))
         
-        usd_mat_path = usd_internal_path+"_mat"
+        usd_mat_path = usd_material_path or usd_internal_path+"_mat"
         material = UsdShade.Material.Define(stage, usd_mat_path)
         stInput = material.CreateInput('frame:stPrimvarName', Sdf.ValueTypeNames.Token)
         stInput.Set('st')
@@ -230,7 +230,8 @@ def convert_mesh_to_usd(stage, usd_internal_path, verts, faces, collision_approx
 
 
 def convert_mesh_to_usd_simple(stage, usd_internal_path, verts, faces, collision_approximation, static, articulation, 
-                        physics_iter=(255, 255), apply_debug_torque=False, debug_torque_value=50.0, texture=None):
+                        physics_iter=(255, 255), apply_debug_torque=False, debug_torque_value=50.0,
+                        texture=None, usd_material_path=None):
     n_verts = verts.shape[0]
     n_faces = faces.shape[0]
 
@@ -269,7 +270,7 @@ def convert_mesh_to_usd_simple(stage, usd_internal_path, verts, faces, collision
                                     UsdGeom.Tokens.faceVarying)
         texCoords.Set(Vt.Vec2fArray.FromNumpy(tex_coords))
         
-        usd_mat_path = usd_internal_path+"_mat"
+        usd_mat_path = usd_material_path or usd_internal_path+"_mat"
         material = UsdShade.Material.Define(stage, usd_mat_path)
         stInput = material.CreateInput('frame:stPrimvarName', Sdf.ValueTypeNames.Token)
         stInput.Set('st')
@@ -431,7 +432,9 @@ def door_frame_to_usd(
     texture_door,
     texture_door_frame,
     apply_debug_torque=False,
-    debug_torque_value=50.0
+    debug_torque_value=50.0,
+    usd_material_path_door=None,
+    usd_material_path_door_frame=None,
 ):
     """
     Create door and door frame USD objects with a revolute joint between them.
@@ -482,7 +485,7 @@ def door_frame_to_usd(
                                     UsdGeom.Tokens.faceVarying)
         texCoords.Set(Vt.Vec2fArray.FromNumpy(tex_coords))
         
-        usd_mat_path = usd_internal_path_door_frame + "_mat"
+        usd_mat_path = usd_material_path_door_frame or usd_internal_path_door_frame + "_mat"
         material = UsdShade.Material.Define(stage, usd_mat_path)
         stInput = material.CreateInput('frame:stPrimvarName', Sdf.ValueTypeNames.Token)
         stInput.Set('st')
@@ -547,7 +550,7 @@ def door_frame_to_usd(
                                     UsdGeom.Tokens.faceVarying)
         texCoords.Set(Vt.Vec2fArray.FromNumpy(tex_coords))
         
-        usd_mat_path = usd_internal_path_door + "_mat"
+        usd_mat_path = usd_material_path_door or usd_internal_path_door + "_mat"
         material = UsdShade.Material.Define(stage, usd_mat_path)
         stInput = material.CreateInput('frame:stPrimvarName', Sdf.ValueTypeNames.Token)
         stInput.Set('st')

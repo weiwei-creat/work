@@ -55,6 +55,7 @@ import traceback
 import sys
 import gc
 import shutil
+import re
 from pxr import Gf, Usd, UsdGeom, UsdLux, Vt, UsdPhysics, PhysxSchema, UsdUtils, Sdf, UsdShade
 
 import omni
@@ -1425,10 +1426,7 @@ class MCPExtension(omni.ext.IExt):
         ceiling_paths = []
         for prim in stage.Traverse():
             path = prim.GetPath().pathString
-            if (
-                path.startswith("/World/floor_")
-                and (path.endswith("_ceiling") or path.endswith("_ceiling_mat"))
-            ):
+            if path.startswith("/World/") and "ceiling" in prim.GetName().lower():
                 ceiling_paths.append(path)
         for path in sorted(ceiling_paths, key=len, reverse=True):
             stage.RemovePrim(path)
@@ -1441,18 +1439,196 @@ class MCPExtension(omni.ext.IExt):
             "/World/SAGEPreviewRectLight",
             "/World/SAGEEnvironmentDomeLight",
             "/World/SAGEEnvironmentDistantLight",
+            "/World/Room/Lights/DomeLight",
+            "/World/Room/Lights/DistantLight",
         ]:
             if stage.GetPrimAtPath(path):
                 stage.RemovePrim(path)
 
-        dome = UsdLux.DomeLight.Define(stage, "/World/SAGEEnvironmentDomeLight")
+        UsdGeom.Xform.Define(stage, "/World/Room")
+        UsdGeom.Xform.Define(stage, "/World/Room/Lights")
+        dome = UsdLux.DomeLight.Define(stage, "/World/Room/Lights/DomeLight")
         dome.CreateIntensityAttr(650.0)
         dome.CreateExposureAttr(0.0)
 
-        distant = UsdLux.DistantLight.Define(stage, "/World/SAGEEnvironmentDistantLight")
+        distant = UsdLux.DistantLight.Define(stage, "/World/Room/Lights/DistantLight")
         distant.CreateIntensityAttr(800.0)
         distant.CreateAngleAttr(0.5)
         distant.AddRotateXYZOp().Set(Gf.Vec3f(-55.0, 0.0, 35.0))
+
+    @staticmethod
+    def _valid_prim_name(value: str) -> str:
+        """Return a stable USD identifier without discarding the generated id."""
+        value = re.sub(r"[^A-Za-z0-9_]", "_", value.strip())
+        if not value:
+            value = "Unnamed"
+        if value[0].isdigit():
+            value = f"_{value}"
+        return value
+
+    def _object_prim_name(self, mesh_id: str) -> str:
+        # room_<uuid>_armchair_<uuid> -> Armchair_<uuid>.  Keeping the final
+        # generated id prevents collisions when a room contains repeated types.
+        short_name = re.sub(r"^room_[0-9A-Fa-f]+_", "", mesh_id)
+        parts = short_name.split("_", 1)
+        if parts:
+            parts[0] = parts[0][:1].upper() + parts[0][1:]
+        return self._valid_prim_name("_".join(parts))
+
+    @staticmethod
+    def _set_delivery_editable(prim, editable: bool):
+        prim.CreateAttribute(
+            "sage:editable", Sdf.ValueTypeNames.Bool, custom=True
+        ).Set(bool(editable))
+
+    @staticmethod
+    def _move_stage_prim(stage, source_path: str, destination_path: str):
+        if not stage.GetPrimAtPath(source_path):
+            return
+        edit = Sdf.BatchNamespaceEdit()
+        edit.Add(Sdf.Path(source_path), Sdf.Path(destination_path))
+        if not stage.GetEditTarget().GetLayer().Apply(edit):
+            raise RuntimeError(f"Could not move {source_path} to {destination_path}")
+
+    def _define_deliverable_hierarchy(self, stage):
+        world = UsdGeom.Xform.Define(stage, "/World")
+        stage.SetDefaultPrim(world.GetPrim())
+        room = UsdGeom.Xform.Define(stage, "/World/Room")
+        objects = UsdGeom.Xform.Define(stage, "/World/Objects")
+        self._set_delivery_editable(room.GetPrim(), False)
+        self._set_delivery_editable(objects.GetPrim(), True)
+        for path in (
+            "/World/Room/Floor",
+            "/World/Room/Walls",
+            "/World/Room/Windows",
+            "/World/Room/Doors",
+            "/World/Room/Lights",
+        ):
+            prim = UsdGeom.Xform.Define(stage, path).GetPrim()
+            self._set_delivery_editable(prim, False)
+
+    def _write_deliverable_mesh(
+        self,
+        stage,
+        item_path: str,
+        mesh_dict: dict,
+        collision_approximation: str,
+        editable: bool,
+    ):
+        item = UsdGeom.Xform.Define(stage, item_path)
+        self._set_delivery_editable(item.GetPrim(), editable)
+        geometry_path = f"{item_path}/Geometry"
+        mesh_obj = mesh_dict["mesh"]
+        stage = convert_mesh_to_usd(
+            stage,
+            geometry_path,
+            mesh_obj.vertices,
+            mesh_obj.faces,
+            collision_approximation,
+            mesh_dict["static"],
+            mesh_dict.get("articulation"),
+            mass=mesh_dict.get("mass", 1.0),
+            physics_iter=(16, 4),
+            apply_debug_torque=False,
+            debug_torque_value=30.0,
+            texture=mesh_dict.get("texture"),
+            usd_internal_art_reference_path=geometry_path,
+            add_damping=True,
+            usd_material_path=f"{item_path}/Material",
+        )
+        return stage
+
+    def _populate_deliverable_stage(self, stage, mesh_info_dict: dict, track_objects=False):
+        """Populate the canonical Room/Objects hierarchy on an empty stage."""
+        self._define_deliverable_hierarchy(stage)
+        collision_approximation = DEFAULT_COLLISION_APPROXIMATION
+        door_ids = []
+        door_frame_ids = []
+        if track_objects:
+            self.track_ids = []
+
+        for mesh_id, mesh_dict in mesh_info_dict.items():
+            if mesh_id.endswith("_ceiling"):
+                continue
+            if mesh_id.startswith("door_"):
+                if mesh_id.endswith("_frame"):
+                    door_frame_ids.append(mesh_id)
+                else:
+                    door_ids.append(mesh_id)
+                continue
+
+            if mesh_id.startswith("floor_"):
+                item_path = f"/World/Room/Floor/{self._valid_prim_name(mesh_id)}"
+                editable = False
+            elif mesh_id.startswith("wall_room_"):
+                item_path = f"/World/Room/Walls/{self._valid_prim_name(mesh_id)}"
+                editable = False
+            elif mesh_id.startswith("window_"):
+                item_path = f"/World/Room/Windows/{self._valid_prim_name(mesh_id)}"
+                editable = False
+            else:
+                item_path = f"/World/Objects/{self._object_prim_name(mesh_id)}"
+                editable = True
+                if track_objects:
+                    self.track_ids.append(mesh_id)
+
+            stage = self._write_deliverable_mesh(
+                stage,
+                item_path,
+                mesh_dict,
+                collision_approximation,
+                editable,
+            )
+
+            if editable:
+                transform = mesh_dict.get("transform") or {}
+                position = transform.get("position") or {"x": 0, "y": 0, "z": 0}
+                rotation = transform.get("rotation") or {"x": 0, "y": 0, "z": 0}
+                object_xform = UsdGeom.Xformable(stage.GetPrimAtPath(item_path))
+                object_xform.AddTranslateOp().Set(
+                    Gf.Vec3d(
+                        float(position.get("x", 0)),
+                        float(position.get("y", 0)),
+                        float(position.get("z", 0)),
+                    )
+                )
+                object_xform.AddRotateXYZOp().Set(
+                    Gf.Vec3f(
+                        float(rotation.get("x", 0)),
+                        float(rotation.get("y", 0)),
+                        float(rotation.get("z", 0)),
+                    )
+                )
+
+        for door_id, door_frame_id in zip(sorted(door_ids), sorted(door_frame_ids)):
+            door_path = f"/World/Room/Doors/{self._object_prim_name(door_id)}"
+            door_prim = UsdGeom.Xform.Define(stage, door_path).GetPrim()
+            self._set_delivery_editable(door_prim, False)
+            panel_path = f"{door_path}/Panel"
+            frame_path = f"{door_path}/Frame"
+            door_dict = mesh_info_dict[door_id]
+            frame_dict = mesh_info_dict[door_frame_id]
+            stage = door_frame_to_usd(
+                stage,
+                panel_path,
+                frame_path,
+                door_dict["mesh"],
+                frame_dict["mesh"],
+                door_dict.get("articulation"),
+                door_dict.get("texture"),
+                frame_dict.get("texture"),
+                usd_material_path_door=f"{door_path}/PanelMaterial",
+                usd_material_path_door_frame=f"{door_path}/FrameMaterial",
+            )
+            generated_joint_path = f"{panel_path}_hinge_joint"
+            hinge_path = f"{door_path}/Hinge"
+            self._move_stage_prim(stage, generated_joint_path, hinge_path)
+            for fixed_path in (panel_path, frame_path, hinge_path):
+                fixed_prim = stage.GetPrimAtPath(fixed_path)
+                if fixed_prim:
+                    self._set_delivery_editable(fixed_prim, False)
+
+        return stage
 
     def _export_stage_snapshot(self, stage, scene_save_dir: str, base_name: str) -> str:
         os.makedirs(scene_save_dir, exist_ok=True)
@@ -1491,74 +1667,13 @@ class MCPExtension(omni.ext.IExt):
             floor_plan = dict_to_floor_plan(layout_data)
             current_layout = floor_plan
             
-            mesh_info_dict = export_layout_to_mesh_dict_list(
+            mesh_info_dict = export_layout_to_mesh_dict_list_no_object_transform(
                 current_layout, os.path.dirname(scene_save_dir)
             )
 
             stage = self._create_fresh_usd_stage(usd_file_path)
 
-            collision_approximation = DEFAULT_COLLISION_APPROXIMATION
-            
-
-            world_base_prim = UsdGeom.Xform.Define(stage, "/World")
-
-            # set default prim to World
-            stage.SetDefaultPrim(stage.GetPrimAtPath("/World"))
-
-            door_ids = []
-            door_frame_ids = []
-
-            for mesh_id in mesh_info_dict:
-                if mesh_id.startswith("door_"):
-                    if mesh_id.endswith("_frame"):
-                        door_frame_ids.append(mesh_id)
-                    else:
-                        door_ids.append(mesh_id)
-                    continue
-                else:
-                    usd_internal_path = f"/World/{mesh_id}"
-                mesh_dict = mesh_info_dict[mesh_id]
-                mesh_obj_i = mesh_dict['mesh']
-                static = mesh_dict['static']
-                articulation = mesh_dict.get('articulation', None)
-                # articulation = None
-                texture = mesh_dict.get('texture', None)
-                mass = mesh_dict.get('mass', 1.0)
-
-                stage = convert_mesh_to_usd(stage, usd_internal_path,
-                                            mesh_obj_i.vertices, mesh_obj_i.faces,
-                                            collision_approximation, static, articulation, physics_iter=(16, 4),
-                                            apply_debug_torque=False, debug_torque_value=30.0, texture=texture,
-                                            usd_internal_art_reference_path=f"/World/{mesh_id}")
-
-
-            door_ids = sorted(door_ids)
-            door_frame_ids = sorted(door_frame_ids)
-
-            for door_id, door_frame_id in zip(door_ids, door_frame_ids):
-                usd_internal_path_door = f"/World/{door_id}"
-                usd_internal_path_door_frame = f"/World/{door_frame_id}"
-
-
-                mesh_dict_door = mesh_info_dict[door_id]
-                mesh_obj_door = mesh_dict_door['mesh']
-                articulation_door = mesh_dict_door.get('articulation', None)
-                texture_door = mesh_dict_door.get('texture', None)
-
-                mesh_dict_door_frame = mesh_info_dict[door_frame_id]
-                mesh_obj_door_frame = mesh_dict_door_frame['mesh']
-                texture_door_frame = mesh_dict_door_frame.get('texture', None)
-
-                stage = door_frame_to_usd(
-                    stage,
-                    usd_internal_path_door,
-                    usd_internal_path_door_frame,
-                    mesh_obj_door,
-                    mesh_obj_door_frame,
-                    articulation_door,
-                    texture_door,
-                    texture_door_frame
-                )
+            stage = self._populate_deliverable_stage(stage, mesh_info_dict)
             self._prepare_deliverable_stage(stage)
             stage.Save()
 
@@ -2347,6 +2462,7 @@ Suggestions:
         usd_file_path: str,
         output_path: str,
         resolution: int = 640,
+        require_delivery_hierarchy: bool = True,
     ):
         """Open a delivered USD in Isaac, validate its contract, and render it."""
         try:
@@ -2404,6 +2520,67 @@ Suggestions:
                 return {"status": "error", "message": "USD contains no authored light"}
             if not np.all(np.isfinite(mesh_min)) or not np.all(np.isfinite(mesh_max)):
                 return {"status": "error", "message": "USD contains no renderable mesh bounds"}
+
+            room_root = stage.GetPrimAtPath("/World/Room")
+            objects_root = stage.GetPrimAtPath("/World/Objects")
+            room_children = [child.GetName() for child in room_root.GetChildren()] if room_root else []
+            object_items = [
+                child.GetPath().pathString for child in objects_root.GetChildren()
+            ] if objects_root else []
+            door_items = []
+            doors_root = stage.GetPrimAtPath("/World/Room/Doors")
+            if doors_root:
+                door_items = [child.GetPath().pathString for child in doors_root.GetChildren()]
+            object_transform_ops = {}
+            for object_path in object_items:
+                prim = stage.GetPrimAtPath(object_path)
+                object_transform_ops[object_path] = [
+                    op.GetOpName() for op in UsdGeom.Xformable(prim).GetOrderedXformOps()
+                ]
+            hierarchy = []
+            material_paths = []
+            for prim in stage.Traverse():
+                path = prim.GetPath().pathString
+                if not path.startswith("/World"):
+                    continue
+                hierarchy.append({"path": path, "type": prim.GetTypeName()})
+                if prim.IsA(UsdShade.Material):
+                    material_paths.append(path)
+
+            if require_delivery_hierarchy:
+                if not room_root or not objects_root:
+                    return {
+                        "status": "error",
+                        "message": "USD is missing /World/Room or /World/Objects",
+                    }
+                expected_room_groups = {"Floor", "Walls", "Windows", "Doors", "Lights"}
+                missing_groups = sorted(expected_room_groups.difference(room_children))
+                if missing_groups:
+                    return {
+                        "status": "error",
+                        "message": f"Room hierarchy is missing groups: {missing_groups}",
+                    }
+                invalid_objects = [
+                    path
+                    for path, ops in object_transform_ops.items()
+                    if "xformOp:translate" not in ops or "xformOp:rotateXYZ" not in ops
+                ]
+                if invalid_objects:
+                    return {
+                        "status": "error",
+                        "message": f"Objects lack independent placement Xforms: {invalid_objects}",
+                    }
+                malformed_objects = [
+                    path
+                    for path in object_items
+                    if not stage.GetPrimAtPath(f"{path}/Geometry")
+                    or not stage.GetPrimAtPath(f"{path}/Material")
+                ]
+                if malformed_objects:
+                    return {
+                        "status": "error",
+                        "message": f"Objects lack Geometry/Material children: {malformed_objects}",
+                    }
 
             mesh_size = mesh_max - mesh_min
             center = (mesh_min + mesh_max) / 2.0
@@ -2494,6 +2671,12 @@ Suggestions:
                 "mesh_size_m": [float(v) for v in mesh_size],
                 "light_paths": light_paths,
                 "ceiling_paths": ceiling_paths,
+                "room_children": room_children,
+                "object_items": object_items,
+                "door_items": door_items,
+                "object_transform_ops": object_transform_ops,
+                "material_paths": material_paths,
+                "hierarchy": hierarchy,
             }
         except Exception as exc:
             print(f"Error validating delivered USD: {exc}")

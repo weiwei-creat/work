@@ -72,9 +72,28 @@ docker run --rm --network host \
 - `upAxis=Z`，不在根节点附加补偿旋转；
 - `metersPerUnit=1.0`，几何尺寸以米为单位；
 - 不包含 roof/ceiling Prim，打开后直接显示室内；
-- USD 内置 `SAGEEnvironmentDomeLight` 和 `SAGEEnvironmentDistantLight`，关闭
+- USD 在 `/World/Room/Lights` 内置 `DomeLight` 和 `DistantLight`，关闭
   Isaac 视口默认灯后场景仍有照明；
 - USD collection 保持同样的 Z-up/米制元数据，并且不导出 ceiling 文件。
+
+主 USD 的场景树固定为：
+
+```text
+/World
+├── /Room                         # 固定环境，sage:editable=false
+│   ├── /Floor
+│   ├── /Walls
+│   ├── /Windows
+│   ├── /Doors               # 门框、门板和 Hinge 属于 Room
+│   └── /Lights
+└── /Objects                      # 可编辑物件
+    └── /<Type>_<id>              # 独立 Xform，含位置和旋转
+        ├── /Geometry              # 局部坐标 Mesh
+        └── /Material
+```
+
+`/World/Objects` 下不再使用已烘焙世界坐标的家具 Mesh；每件物体的
+`position`/`rotation` 写在自身 Xform 上，因此可在 Isaac Sim 中独立选中、平移和旋转。
 
 不要把旧版本中声明为 `Y-up`、`metersPerUnit=0.01` 的原始 USD 作为交付物。该旧元数据会让
 Isaac 米制资产表现出旋转异常和约 100 倍的比例差异。
@@ -94,3 +113,6 @@ manifest.json
   ├── preview/
   └── room_*.json/.usd/.usdz
 ```
+
+`<SCENE_NAME>.usd` 固定复制主文件 `<layout_id>.usd`，不再优先使用仅供预览的
+`<layout_id>_view.usd`，因此 MinIO 标准入口保留上述 Room/Objects 层级。
