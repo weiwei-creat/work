@@ -10,7 +10,7 @@
 ## 构建镜像
 
 ```bash
-docker build -f Dockerfile.scene-gen -t sage-scene-gen:isaac45 .
+docker build -f Dockerfile.scene-gen -t sage-scene-gen:isaac45-hierarchy-final-20260821 .
 ```
 
 ## 必需的环境变量
@@ -59,7 +59,7 @@ docker run --rm --network host \
   -e SCENE_NAME='modern-bedroom' \
   -e SAGE_OBJATHOR_ROOT='/data/gaok/sage/objathor' \
   -e SAGE_RESULTS_DIR='/data/gaok/sage/runtime/results' \
-  sage-scene-gen:isaac45-reproduced
+  sage-scene-gen:isaac45-hierarchy-final-20260821
 ```
 
 `scene-job.env` 应包含上文列出的任务、LLM 和 MinIO 变量，但不得提交到 Git 或随镜像分发。

@@ -6,9 +6,9 @@
 
 - Docker 镜像文件：`/data/gaok/sage/sage-scene-gen-isaac45.tar`
 - 镜像文件大小：1,823,836,672 字节（约 1.70 GiB）
-- 镜像标签：`sage-scene-gen:isaac45-reproduced`
+- 镜像标签：`sage-scene-gen:isaac45-hierarchy-final-20260821`
 - 23 号开发机当前镜像 ID：`sha256:ab3a6c0db112cd38f7624811df8ef92d3202bea1434969e020c289d5175da297`
-- 镜像文件 SHA-256：`f6c51f52daf620300d6f26dca8f906427532f91c7588ea91e198868ed8c4c3c0`
+- 镜像文件 SHA-256：`090b81861a5dd93fd4ffe4462aa11b2b13cb400c9bd7cec9ffdb843c54ea0080`
 - 项目目录：`/data/gaok/sage`
 - Objathor 资源目录：`/data/gaok/sage/objathor`，约 45 GB
 - 场景结果目录：`/data/gaok/sage/runtime/results`
@@ -28,7 +28,7 @@ sha256sum sage-scene-gen-isaac45.tar
 输出应为：
 
 ```text
-f6c51f52daf620300d6f26dca8f906427532f91c7588ea91e198868ed8c4c3c0  sage-scene-gen-isaac45.tar
+090b81861a5dd93fd4ffe4462aa11b2b13cb400c9bd7cec9ffdb843c54ea0080  sage-scene-gen-isaac45.tar
 ```
 
 > 镜像文件当前属于 `ubuntu` 用户。如果其他用户无法读取，请通过 `ubuntu` 用户执行部署，
@@ -104,10 +104,10 @@ docker load -i sage-scene-gen-isaac45.tar
 确认镜像已经导入：
 
 ```bash
-docker image inspect sage-scene-gen:isaac45-reproduced \
+docker image inspect sage-scene-gen:isaac45-hierarchy-final-20260821 \
   --format '镜像={{.Id}} 入口={{json .Config.Entrypoint}}'
 
-docker image inspect sage-scene-gen:isaac45-reproduced \
+docker image inspect sage-scene-gen:isaac45-hierarchy-final-20260821 \
   --format '{{json .Config}}'
 ```
 
@@ -259,7 +259,7 @@ docker run --rm \
   -v /home/ubuntu/models/all-mpnet-base-v2:/models/all-mpnet-base-v2:ro \
   -v /home/ubuntu/.cache/huggingface:/root/.cache/huggingface:ro \
   -v /data/gaok/sage/runtime/tools/mc:/tools/mc:ro \
-  sage-scene-gen:isaac45-reproduced
+  sage-scene-gen:isaac45-hierarchy-final-20260821
 ```
 
 注意：
@@ -283,7 +283,7 @@ docker run -d \
   -v /home/ubuntu/models/all-mpnet-base-v2:/models/all-mpnet-base-v2:ro \
   -v /home/ubuntu/.cache/huggingface:/root/.cache/huggingface:ro \
   -v /data/gaok/sage/runtime/tools/mc:/tools/mc:ro \
-  sage-scene-gen:isaac45-reproduced
+  sage-scene-gen:isaac45-hierarchy-final-20260821
 
 docker logs -f sage-scene-job-001
 docker wait sage-scene-job-001
